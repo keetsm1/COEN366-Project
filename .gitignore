@@ -1,0 +1,52 @@
+# === Java Build Artifacts ===
+*.class
+*.jar
+*.war
+*.ear
+
+# === IDE / Editor Files ===
+.vscode/
+.idea/
+*.iml
+
+# === Build System ===
+bin/
+out/
+target/
+build/
+
+# === Logs ===
+logs/
+*.log
+
+# === OS / Temporary Files ===
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+
+# === Config / Credentials ===
+config/server_config.json
+config/peer_config.json
+
+# (You can commit sample_config.json instead to show format)
+
+# === Generated / Runtime Files ===
+storage/
+backup_temp/
+*.chunk
+*.crc
+*.bak
+
+# === Test Output ===
+test-output/
+coverage/
+
+# === Java Crash Logs ===
+hs_err_pid*
+replay_pid*
+
+# === Misc ===
+*.classfile
+*.orig
+*.rej
