@@ -59,26 +59,28 @@ public class PeerUDP{
         ds.close();
     }
 
+	// RQ# generator: 01..99 then wraps
+	private static int rqCounter = 1;
 
-    // RQ# generator: 01..99 then wraps
-    private static int rqCounter = 1;
-    private static String nextRq(){
-        String rq = String.format("%02d", rqCounter);
-        rqCounter = (rqCounter % 99) + 1;
-        return rq;
-    }
+	private static String nextRq() {
+		String rq = String.format("%02d", rqCounter);
+		rqCounter = (rqCounter % 99) + 1;
+		return rq;
+	}
 
+	public static String formatRegistration(String name, String role, InetAddress ipAddress, int udpPort, int tcpPort,
+			long storageCapacity) {
 
-    public static String formatRegistration(String name, String role, InetAddress ipAddress, 
-    int udpPort, int tcpPort, long storageCapacity) {
-        // Registration logic here
-        //format: REGISTER RQ# Name Role IP_Address UDP_Port# TCP_Port# Storage_Capacity
+		return String.format("REGISTER %d %s %s %s %d %d %dMB", rqCounter, name, role, ipAddress.getHostAddress(),
+				udpPort, tcpPort, storageCapacity);
 
-        return String.format("REGISTER 01 %s %s %s %d %d %dMB",
-                            name, role, ipAddress.getHostAddress(),
-                            udpPort, tcpPort, storageCapacity);
+	}
 
-    }
+	public static String formatDeregistration(String name) {
+
+		return String.format("DE-REGISTER %d %s", rqCounter, name);
+
+	}
 
     public static void sendRegistration(DatagramSocket socket, InetAddress serverAddr, int serverPort,
                                             String name, String role, int tcpPort, long storageCapacity) throws IOException {
@@ -95,7 +97,7 @@ public class PeerUDP{
                                           String name) throws IOException {
         // Format: DE-REGISTER RQ# Name
         String rq = nextRq();
-        String msg = String.format("DE-REGISTER %s %s", rq, name);
+        String msg = formatDeregistration(name);
         byte[] data = msg.getBytes();
         DatagramPacket packet = new DatagramPacket(data, data.length, serverAddr, serverPort);
         socket.send(packet);
