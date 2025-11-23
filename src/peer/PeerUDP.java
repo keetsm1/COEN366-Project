@@ -38,6 +38,7 @@ public class PeerUDP{
 
         System.out.println("Write messages to send to server (type 'bye' to exit):");
         System.out.println("Type 'de' to deregister.");
+        System.out.println("Type 'list' to see registered peers.");
         while(true){
             String inp = sc.nextLine();
 
@@ -45,6 +46,18 @@ public class PeerUDP{
                 // Send de-registration and exit
                 sendDeregistration(ds, ip, serverPort, name);
                 break;
+            }
+
+            if (inp.equalsIgnoreCase("list")) {
+                byte[] data = "LIST".getBytes();
+                DatagramPacket pkt = new DatagramPacket(data, data.length, ip, serverPort);
+                ds.send(pkt);
+                byte[] bufList = new byte[4096];
+                DatagramPacket resp = new DatagramPacket(bufList, bufList.length);
+                ds.receive(resp);
+                String listResp = new String(resp.getData(), 0, resp.getLength()).trim();
+                System.out.println("Server: " + listResp);
+                continue;
             }
 
             if (inp.equalsIgnoreCase("bye")) {
@@ -60,26 +73,23 @@ public class PeerUDP{
     }
 
 	// RQ# generator: 01..99 then wraps
-	private static int rqCounter = 1;
+    private static int rqCounter = 0;
 
-	private static String nextRq() {
-		String rq = String.format("%02d", rqCounter);
-		rqCounter = (rqCounter % 99) + 1;
-		return rq;
-	}
+    private static int nextRq() {
+        rqCounter = (rqCounter % 99) + 1; // 1..99
+        return rqCounter;
+    }
 
 	public static String formatRegistration(String name, String role, InetAddress ipAddress, int udpPort, int tcpPort,
 			long storageCapacity) {
 
-		return String.format("REGISTER %d %s %s %s %d %d %dMB", rqCounter, name, role, ipAddress.getHostAddress(),
-				udpPort, tcpPort, storageCapacity);
+        return String.format("REGISTER %d %s %s %s %d %d %dMB", nextRq(), name, role, ipAddress.getHostAddress(),
+                udpPort, tcpPort, storageCapacity);
 
 	}
 
 	public static String formatDeregistration(String name) {
-
-		return String.format("DE-REGISTER %d %s", rqCounter, name);
-
+        return String.format("DE-REGISTER %d %s", nextRq(), name);
 	}
 
     public static void sendRegistration(DatagramSocket socket, InetAddress serverAddr, int serverPort,
@@ -96,12 +106,17 @@ public class PeerUDP{
     public static void sendDeregistration(DatagramSocket socket, InetAddress serverAddr, int serverPort,
                                           String name) throws IOException {
         // Format: DE-REGISTER RQ# Name
-        String rq = nextRq();
         String msg = formatDeregistration(name);
         byte[] data = msg.getBytes();
         DatagramPacket packet = new DatagramPacket(data, data.length, serverAddr, serverPort);
         socket.send(packet);
         System.out.println("Sent: " + msg );
+        // Wait for server response
+        byte[] buf = new byte[1024];
+        DatagramPacket resp = new DatagramPacket(buf, buf.length);
+        socket.receive(resp);
+        String r = new String(resp.getData(), 0, resp.getLength()).trim();
+        System.out.println("Server response: " + r);
     }
 }
 

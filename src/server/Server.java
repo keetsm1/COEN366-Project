@@ -12,7 +12,7 @@ public class Server {
 	private static HashMap<String, PeerData> peers;
     public static void main(String[] args) throws IOException {
     	peers = new HashMap<>();
-    	int serverPort = 1234;
+    	
         try (DatagramSocket ds = new DatagramSocket(1234)) {
             byte[] receive = new byte[65535];
             System.out.println("UDP server listening on port 1234...");
@@ -21,6 +21,7 @@ public class Server {
                 DatagramPacket dpReceive = new DatagramPacket(receive, receive.length);
                 ds.receive(dpReceive);
                 String msg = new String(dpReceive.getData(), 0, dpReceive.getLength()).trim();
+				System.out.printf("Server received: '%s' from %s:%d%n", msg, dpReceive.getAddress().getHostAddress(), dpReceive.getPort());
                 if ("bye".equalsIgnoreCase(msg)) {
                     System.out.println("Client sent bye.....EXITING");
                     break;
@@ -28,6 +29,42 @@ public class Server {
                 else {
                 	//Read the message and add a new peer to the hashmap so that the server can *track* peers.
                     String[] parts = msg.split("\\s+");
+
+					if (parts.length == 0) continue;
+					String cmd = parts[0].toUpperCase();
+
+					//query to see what's in the registry
+					if ("LIST".equals(cmd)) {
+						StringBuilder sb = new StringBuilder("PEERS ").append(peers.size());
+						for (PeerData pd : peers.values()) {
+							sb.append(' ') // name ip udp tcp
+							  .append(pd.getName()).append(' ')
+							  .append(pd.getIp().getHostAddress()).append(' ')
+							  .append(pd.getUdpPort()).append(' ')
+							  .append(pd.getTcpPort());
+						}
+						sendSimple(ds, dpReceive, sb.toString());
+						receive = new byte[65535];
+						continue;
+					}
+
+					if("DE-REGISTER".equalsIgnoreCase(cmd)) {
+						if (parts.length< 3){
+							sendSimple(ds,dpReceive, "DE-REGISTER-DENIED 00 REASON: Malformed");
+						}else{
+							int rq= safeInt(parts[1]);
+							String name= parts[2];
+							PeerData removed = peers.remove(name);
+							if (removed == null){
+								sendSimple(ds,dpReceive, "DE-REGISTER-DENIED "+rq+" REASON: NotRegistered");
+							} else {
+								System.out.printf("Peer '%s' deregistered. (remaining=%d)%n", name, peers.size());
+								sendSimple(ds,dpReceive, "DE-REGISTERED "+rq);
+							}
+						}
+						receive = new byte[65535];
+						continue; // avoid falling through to REGISTER parsing
+					}
                 	int rq = Integer.parseInt(parts[1]);
                 	String name = parts[2];
                 	String role = parts[3];
@@ -41,10 +78,13 @@ public class Server {
 					if (!peers.containsKey(name)) {
 						PeerData newPeer = new PeerData(name, role, ip, udpPort, tcpPort, storage);
 						peers.put(name, newPeer);
+						System.out.printf("Accepting registration: name=%s role=%s udpPort=%d tcpPort=%d storage=%s (total peers=%d)%n", name, role, udpPort, tcpPort, storage, peers.size());
 						acceptRegistration(ds, dpReceive.getAddress(), dpReceive.getPort(), msg, 5678, 1024, rq);
+						System.out.println("Current peers: " + peers.keySet());
 					}
 					//Hashmap DOES already have this peer stored, don't add it to map and deny registration
 					else {
+						System.out.printf("Denying registration for existing peer name=%s (total peers=%d)%n", name, peers.size());
 						denyRegistration(ds, dpReceive.getAddress(), dpReceive.getPort(), msg, 5678, 1024, rq,
 								"REASON: Peer registered in server");
 					}
@@ -59,9 +99,17 @@ public class Server {
         }
 	}
 
+    private static int safeInt(String s) {
+        try { return Integer.parseInt(s); } catch (Exception e) { return 0; }
+    }
+    private static void sendSimple(DatagramSocket ds, DatagramPacket req, String text) throws IOException {
+        byte[] d = text.getBytes();
+        ds.send(new DatagramPacket(d, d.length, req.getAddress(), req.getPort()));
+    }
+
 	public static void acceptRegistration(DatagramSocket socket, InetAddress clientAddr, int serverPort, String name,
 			int tcpPort, int storageCapacity, int rq) throws IOException {
-		// int udpPort = socket.getLocalPort();
+		//int udpPort = socket.getLocalPort();
 		String response = formatAcceptResponse(rq);
 		byte[] sendData = response.getBytes();
 		DatagramPacket dpSendResponse = new DatagramPacket(sendData, sendData.length, clientAddr, serverPort);
