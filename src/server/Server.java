@@ -249,7 +249,45 @@ public class Server {
 					}
 					receive = new byte[65535];
 					continue;
-				}		
+				}
+
+				//RESTORE_OK RQ# File_Name
+				if ("RESTORE_OK".equalsIgnoreCase(cmd)) {
+					if (parts.length >= 3) {
+						int rq = safeInt(parts[1]);
+						String fileName = parts[2];
+						String ownerName = null;
+						for (PeerData pd : peers.values()) {
+							if (pd.getIp().equals(dpReceive.getAddress()) && pd.getUdpPort() == dpReceive.getPort()) {
+								ownerName = pd.getName();
+								break;
+							}
+						}
+						System.out.printf("RESTORE_OK received: rq=%02d file=%s from owner=%s - Restoration successful%n", rq, fileName, ownerName);
+					}
+					receive = new byte[65535];
+					continue;
+				}
+
+				//RESTORE_FAIL RQ# File_Name Reason
+				if ("RESTORE_FAIL".equalsIgnoreCase(cmd)) {
+					if (parts.length >= 3) {
+						int rq = safeInt(parts[1]);
+						String fileName = parts[2];
+						String reason = parts.length >= 4 ? parts[3] : "Unknown";
+						String ownerName = null;
+						for (PeerData pd : peers.values()) {
+							if (pd.getIp().equals(dpReceive.getAddress()) && pd.getUdpPort() == dpReceive.getPort()) {
+								ownerName = pd.getName();
+								break;
+							}
+						}
+						System.out.printf("RESTORE_FAIL received: rq=%02d file=%s from owner=%s - Reason: %s%n", rq, fileName, ownerName, reason);
+					}
+					receive = new byte[65535];
+					continue;
+				}
+		
 				if ("RESTORE_REQ".equalsIgnoreCase(cmd)) {
     				if (parts.length < 3) {
         					int rq = parts.length > 1 ? safeInt(parts[1]) : 0;
