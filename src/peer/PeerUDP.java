@@ -7,6 +7,8 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.util.Scanner;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.IntSupplier;
 import java.util.zip.CRC32;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -24,6 +26,8 @@ public class PeerUDP{
         InetAddress ip = InetAddress.getLocalHost();
         byte buf[] = null;
         int serverPort = 1234;
+        String serverHost = ip.getHostAddress(); // Assuming server is on localhost
+        HeartbeatService heartbeatService = null;
 
         //Create TCP server socket with random port 0 means it will auto assign an available port
         ServerSocket tcpServerSocket = new ServerSocket(0);
@@ -52,6 +56,19 @@ public class PeerUDP{
             System.out.println("Registration accepted by server.");
         }
 
+        //heartbeat integration
+        IntSupplier chunkCountSupplier = () -> {
+            File storageDir = new File("storage");
+            if (storageDir.exists() && storageDir.isDirectory()) {
+                String[] files = storageDir.list();
+                return files != null ? files.length : 0;
+            }
+            return 0;
+        };
+        int heartbeatInterval = 10; // seconds
+        heartbeatService = new HeartbeatService(name, ds, serverHost, serverPort, heartbeatInterval, rqCounter, chunkCountSupplier);
+        heartbeatService.start();
+        System.out.println("Heartbeat service started.");
         System.out.println("Write messages to send to server (type 'bye' to exit):");
         System.out.println("Type 'de' to deregister.");
         System.out.println("Type 'list' to see registered peers.");
@@ -341,14 +358,17 @@ public class PeerUDP{
         }
         sc.close();
         ds.close();
+        if (heartbeatService != null) {
+            heartbeatService.close();
+            System.out.println("Heartbeat service stopped.");
+        }
     }
 
 	// RQ# generator: 01..99 then wraps
-    private static int rqCounter = 0;
+    private static final AtomicInteger rqCounter = new AtomicInteger(0);
 
     private static int nextRq() {
-        rqCounter = (rqCounter % 99) + 1; // 1..99
-        return rqCounter;
+        return (rqCounter.getAndIncrement() % 99) + 1; // 1..99
     }
 
 	public static String formatRegistration(String name, String role, InetAddress ipAddress, int udpPort, int tcpPort,
