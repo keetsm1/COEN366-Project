@@ -204,7 +204,61 @@ public class Server {
 					}
 					receive = new byte[65535];
 					continue;
-				}					
+				}		
+				if ("RESTORE_REQ".equalsIgnoreCase(cmd)) {
+    				if (parts.length < 3) {
+        					int rq = parts.length > 1 ? safeInt(parts[1]) : 0;
+        					sendSimple(ds, dpReceive,
+                			String.format("RESTORE_FAIL %02d %s Malformed", rq,
+                        	(parts.length > 2 ? parts[2] : "UNKNOWN")));
+        					receive = new byte[65535];
+        					continue;}	
+
+    			int rq = safeInt(parts[1]);
+    			String fileName = parts[2];
+
+    			// find which peer is asking (owner)
+    			String owner = null;
+    			for (PeerData pd : peers.values()) {
+        		if (pd.getIp().equals(dpReceive.getAddress())
+                && pd.getUdpPort() == dpReceive.getPort()) {
+            	owner = pd.getName();
+            	break;}
+			}
+
+    	if (owner == null) {
+        		sendSimple(ds, dpReceive,
+                String.format("RESTORE_FAIL %02d %s NotRegistered", rq, fileName));
+        		receive = new byte[65535];
+        		continue;
+    			}
+
+    			String key = owner + ":" + fileName;
+    			java.util.List<String> entries = backupTable.get(key);
+    			if (entries == null || entries.isEmpty()) {
+        		sendSimple(ds, dpReceive,
+                String.format("RESTORE_FAIL %02d %s NoBackupFound", rq, fileName));
+        		receive = new byte[65535];
+        		continue;
+    			}
+
+    			// entries are like "peerName:chunkId"
+    			StringBuilder peerList = new StringBuilder("[");
+    			for (int i = 0; i < entries.size(); i++) {
+        		String entry = entries.get(i);
+        		String peerName = entry.split(":", 2)[0];
+				if (i > 0) peerList.append(',');
+				peerList.append(peerName);
+				}
+				peerList.append("]");
+
+				String plan = String.format("RESTORE_PLAN %02d %s %s", rq, fileName, peerList);
+				System.out.println("Sending: " + plan);
+				sendSimple(ds, dpReceive, plan);
+				receive = new byte[65535];
+				continue;
+				}
+				
                 	int rq = Integer.parseInt(parts[1]);
                 	String name = parts[2];
                 	String role = parts[3];

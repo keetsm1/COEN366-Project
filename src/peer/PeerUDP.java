@@ -228,6 +228,109 @@ public class PeerUDP{
                 continue;
             }
 
+            if (inp.toLowerCase().startsWith("restore")) {
+            String fileName = inp.substring(7).trim();
+            if (fileName.isEmpty()) {
+                            System.out.println("Usage: restore <filename>");
+                            continue;
+                        }
+                        // === SEND RESTORE_REQ ===
+                        int rq = nextRq();
+                        String req = String.format("RESTORE_REQ %02d %s", rq, fileName);
+                        byte[] reqData = req.getBytes();
+                        ds.send(new DatagramPacket(reqData, reqData.length, ip, serverPort));
+
+                        // === WAIT FOR RESTORE_PLAN / RESTORE_FAIL ===
+                        byte[] restorebuf = new byte[2048];
+                        DatagramPacket resp = new DatagramPacket(restorebuf, restorebuf.length);
+                        ds.receive(resp);
+                        String respMsg = new String(resp.getData(), 0, resp.getLength()).trim();
+                        System.out.println("Server: " + respMsg);
+
+                        if (respMsg.startsWith("RESTORE_FAIL")) {
+                            continue;
+                        }
+                        if (!respMsg.startsWith("RESTORE_PLAN")) {
+                            System.out.println("Unexpected response from server.");
+                            continue;
+                        }
+
+                        // === PARSE PLAN ===
+                        String[] parts = respMsg.split("\\s+");
+                        String planFile = parts[2];
+                        String rawList = parts[3];        // ex: [PeerB]
+                        String inner = rawList.substring(1, rawList.length() - 1);
+                        String[] peerNames = inner.isEmpty() ? new String[0] : inner.split(",");
+
+                        if (peerNames.length == 0) {
+                            System.out.println("No storage peers found in plan.");
+                            continue;
+                        }
+
+                        String storagePeer = peerNames[0];
+
+                        // === GET CHUNK VIA TCP ===
+                        PeerData target = knownPeers.get(storagePeer);
+                        if (target == null) {
+                            System.out.println("Cannot find storage peer. Try 'list'.");
+                            continue;
+                        }
+
+                        try (Socket sock = new Socket(target.getIp(), target.getTcpPort())) {
+                            InputStream in = sock.getInputStream();
+                            OutputStream out = sock.getOutputStream();
+
+                            int rqGet = nextRq();
+                            String header = String.format("GET_CHUNK %02d %s %d\n", rqGet, planFile, 0);
+                            out.write(header.getBytes());
+                            out.flush();
+
+                            // === READ CHUNK_DATA HEADER ===
+                            StringBuilder line = new StringBuilder();
+                            int c;
+                            while ((c = in.read()) != -1 && c != '\n') line.append((char)c);
+                            String h = line.toString().trim();
+                            String[] hh = h.split("\\s+");
+                            int chunkSize = Integer.parseInt(hh[4]);
+                            long checksum = Long.parseLong(hh[5]);
+
+                            File outDir = new File("restored");
+                            outDir.mkdirs();
+                            File outFile = new File(outDir, planFile);
+
+                            CRC32 crc = new CRC32();
+                            try (FileOutputStream fos = new FileOutputStream(outFile)) {
+                                byte[] bb = new byte[8192];
+                                int remaining = chunkSize;
+                                while (remaining > 0) {
+                                    int n = in.read(bb, 0, Math.min(bb.length, remaining));
+                                    if (n == -1) break;
+                                    fos.write(bb, 0, n);
+                                    crc.update(bb, 0, n);
+                                    remaining -= n;
+                                }
+                            }
+
+                            long calc = crc.getValue();
+                            boolean ok = (calc == checksum);
+                            System.out.println("Restore checksum: " + ok);
+
+                            // === REPORT TO SERVER ===
+                            int rqReport = nextRq();
+                            String rep = ok
+                                    ? String.format("RESTORE_OK %02d %s", rqReport, planFile)
+                                    : String.format("RESTORE_FAIL %02d %s ChecksumMismatch", rqReport, planFile);
+                            ds.send(new DatagramPacket(rep.getBytes(), rep.length(), ip, serverPort));
+
+                            if (ok) System.out.println("File restored to /restored/");
+                        }
+                        catch (Exception e){
+                            System.out.println("Restore error: " + e.getMessage());
+                        }
+
+                        continue;
+                    }
+
             if (inp.equalsIgnoreCase("bye")) {
                 break;
             }
@@ -309,34 +412,48 @@ public class PeerUDP{
     //TCP server to receive SEND_CHUNK frames
     //this method accepts a tcp connection, reads the header, and extracts the following info
     //fileName, chunkId, chunkSize, checksum
-    private static void startTcpChunkServer(ServerSocket ss, DatagramSocket udpSocket, InetAddress serverAddr, int serverPort, String selfName) {
-        new Thread(() -> {
-            try {
-                System.out.println("TCP chunk server listening on port " + ss.getLocalPort());
-                while (true) {
-                    try (Socket s = ss.accept()) {
-                        InputStream in = s.getInputStream();
-                        StringBuilder line = new StringBuilder();
-                        int c;
-                        while ((c = in.read()) != -1 && c != '\n') line.append((char)c);
-                        String header = line.toString().trim();
-                        String[] h = header.split("\\s+");
-                        if (h.length < 6 || !"SEND_CHUNK".equalsIgnoreCase(h[0])) {
-                            System.out.println("Invalid chunk header: " + header);
+
+private static void startTcpChunkServer(ServerSocket ss, DatagramSocket udpSocket,
+                                        InetAddress serverAddr, int serverPort, String selfName) {
+    new Thread(() -> {
+        try {
+            System.out.println("TCP chunk server listening on port " + ss.getLocalPort());
+            while (true) {
+                try (Socket s = ss.accept()) {
+                    InputStream in = s.getInputStream();
+                    OutputStream out = s.getOutputStream();
+
+                    // read first line
+                    StringBuilder line = new StringBuilder();
+                    int c;
+                    while ((c = in.read()) != -1 && c != '\n') line.append((char)c);
+                    String header = line.toString().trim();
+                    String[] h = header.split("\\s+");
+                    if (h.length == 0) {
+                        System.out.println("Empty TCP header");
+                        continue;
+                    }
+
+                    String cmd = h[0].toUpperCase();
+
+                    if ("SEND_CHUNK".equals(cmd)) {
+                        if (h.length < 6) {
+                            System.out.println("Invalid SEND_CHUNK header: " + header);
                             continue;
                         }
-                        int rq = safeInt(h[1]);
+
+                        int rq       = safeInt(h[1]);
                         String fileName = h[2];
-                        int chunkId = safeInt(h[3]);
+                        int chunkId  = safeInt(h[3]);
                         int chunkSize = safeInt(h[4]);
-                        long checksum = 0L; try { checksum = Long.parseLong(h[5]); } catch (Exception ignore) {}
+                        long checksum = 0L;
+                        try { checksum = Long.parseLong(h[5]); } catch (Exception ignore) {}
 
                         File outDir = new File("storage");
                         outDir.mkdirs();
-
                         File outFile = new File(outDir, fileName + "." + chunkId + ".part");
-                        CRC32 crc = new CRC32();
 
+                        CRC32 crc = new CRC32();
                         try (FileOutputStream fos = new FileOutputStream(outFile)) {
                             int remaining = chunkSize;
                             byte[] bufLocal = new byte[8192];
@@ -348,33 +465,83 @@ public class PeerUDP{
                                 remaining -= n;
                             }
                         }
+
                         long calc = crc.getValue();
                         boolean ok = (calc == checksum);
-                        String ackMsg = ok ? String.format("CHUNK_OK %02d %s %d", rq, fileName, chunkId)
-                                           : String.format("CHUNK_ERROR %02d %s %d ChecksumMismatch", rq, fileName, chunkId);
+                        String ackMsg = ok
+                                ? String.format("CHUNK_OK %02d %s %d", rq, fileName, chunkId)
+                                : String.format("CHUNK_ERROR %02d %s %d ChecksumMismatch", rq, fileName, chunkId);
                         byte[] ackData = ackMsg.getBytes();
-                        
-                       
                         udpSocket.send(new DatagramPacket(ackData, ackData.length, serverAddr, serverPort));
-                        System.out.printf("Stored chunk file=%s id=%d size=%d checksum=%d calc=%d ok=%s%n", fileName, chunkId, chunkSize, checksum, calc, ok);
-                        
-                        //Send STORE_ACK to server after successful storage
+                        System.out.printf("Stored chunk file=%s chunk=%d size=%d checksumSent=%d checksumCalc=%d ok=%s%n",
+                                fileName, chunkId, chunkSize, checksum, calc, ok);
+
                         if (ok) {
                             String storeKey = fileName + ":" + chunkId;
-                            int rqStore = rq; //reuse the same rq# from the chunk send
+                            int rqStore = rq;
                             String storeAck = String.format("STORE_ACK %02d %s %d", rqStore, fileName, chunkId);
                             byte[] storeAckData = storeAck.getBytes();
                             udpSocket.send(new DatagramPacket(storeAckData, storeAckData.length, serverAddr, serverPort));
                             System.out.printf("Sent STORE_ACK to server: file=%s chunk=%d%n", fileName, chunkId);
                             expectedStoreReqs.remove(storeKey);
                         }
-                    } catch (IOException ex) {
-                        System.err.println("TCP receive error: " + ex.getMessage());
+
+                    } else if ("GET_CHUNK".equals(cmd)) {
+                        if (h.length < 4) {
+                            System.out.println("Invalid GET_CHUNK header: " + header);
+                            continue;
+                        }
+
+                        int rq       = safeInt(h[1]);
+                        String fileName = h[2];
+                        int chunkId  = safeInt(h[3]);
+
+                        File inFile = new File("storage", fileName + "." + chunkId + ".part");
+                        if (!inFile.exists()) {
+                            System.out.println("Requested chunk not found: " + inFile.getAbsolutePath());
+                            // (you could send an error header here if you want)
+                            continue;
+                        }
+
+                        long chunkSize = inFile.length();
+                        CRC32 crc = new CRC32();
+                        byte[] bufLocal = new byte[8192];
+
+                        // compute checksum
+                        try (FileInputStream fis = new FileInputStream(inFile)) {
+                            int n;
+                            while ((n = fis.read(bufLocal)) != -1) {
+                                crc.update(bufLocal, 0, n);
+                            }
+                        }
+                        long checksum = crc.getValue();
+
+                        // send CHUNK_DATA header
+                        String dataHeader = String.format("CHUNK_DATA %02d %s %d %d %d\n",
+                                rq, fileName, chunkId, chunkSize, checksum);
+                        out.write(dataHeader.getBytes());
+                        out.flush();
+
+                        // send file bytes
+                        try (FileInputStream fis = new FileInputStream(inFile)) {
+                            int n;
+                            while ((n = fis.read(bufLocal)) != -1) {
+                                out.write(bufLocal, 0, n);
+                            }
+                        }
+                        out.flush();
+                        System.out.printf("Sent CHUNK_DATA file=%s chunk=%d size=%d checksum=%d%n",
+                                fileName, chunkId, chunkSize, checksum);
+                    } else {
+                        System.out.println("Unknown TCP command: " + header);
                     }
+                } catch (IOException ex) {
+                    System.err.println("TCP receive error: " + ex.getMessage());
                 }
-            } finally {
-                try { ss.close(); } catch (IOException ignore) {}
             }
+        } finally {
+            try { ss.close(); } catch (IOException ignore) {}
+        }
         }, "tcp-chunk-server").start();
     }
 }
