@@ -65,7 +65,7 @@ public class PeerUDP{
             }
             return 0;
         };
-        int heartbeatInterval = 10; // seconds
+        int heartbeatInterval = 60; // sending heartbeat every 60 secs. used to be 10 but too much spam in console.
         heartbeatService = new HeartbeatService(name, ds, serverHost, serverPort, heartbeatInterval, rqCounter, chunkCountSupplier);
         heartbeatService.start();
         System.out.println("Heartbeat service started.");
@@ -73,6 +73,7 @@ public class PeerUDP{
         System.out.println("Type 'de' to deregister.");
         System.out.println("Type 'list' to see registered peers.");
         System.out.println("Type 'backup filename' to request backup plan and send chunk.");
+        System.out.println("Type 'restore filename' to restore a file.");
 
         //Start TCP chunk server to receive SEND_CHUNK frames if this peer is chosen as storage
         startTcpChunkServer(tcpServerSocket, ds, ip, serverPort, name);
@@ -330,7 +331,12 @@ public class PeerUDP{
 
                             long calc = crc.getValue();
                             boolean ok = (calc == checksum);
-                            System.out.println("Restore checksum: " + ok);
+                            System.out.printf("Restore checksum match? %s (expected=%d actual=%d)%n", ok, checksum, calc);
+                            if (ok) {
+                                System.out.printf("RESTORE SUCCESS:", planFile);
+                            } else {
+                                System.out.printf("RESTORE FAILURE:", planFile);
+                            }
 
                             // === REPORT TO SERVER ===
                             int rqReport = nextRq();
@@ -338,8 +344,6 @@ public class PeerUDP{
                                     ? String.format("RESTORE_OK %02d %s", rqReport, planFile)
                                     : String.format("RESTORE_FAIL %02d %s ChecksumMismatch", rqReport, planFile);
                             ds.send(new DatagramPacket(rep.getBytes(), rep.length(), ip, serverPort));
-
-                            if (ok) System.out.println("File restored to /restored/");
                         }
                         catch (Exception e){
                             System.out.println("Restore error: " + e.getMessage());

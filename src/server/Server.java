@@ -12,6 +12,10 @@ public class Server {
 	private static HashMap<String, PeerData> peers;
 	private static HashMap<String, java.util.List<String>> backupTable; // {"owner:filename" -> ["peer:chunkID", ...]}
 	private static int serverRqCounter = 0;
+	// Heartbeat tracking: last received time (server clock) and reported chunk counts
+	private static java.util.Map<String, Long> lastHeartbeat = new java.util.concurrent.ConcurrentHashMap<>();
+	private static java.util.Map<String, Integer> heartbeatChunkCounts = new java.util.concurrent.ConcurrentHashMap<>();
+	private static final long HEARTBEAT_TIMEOUT_MS = 60000; // 60s timeout
 	
 	private static int nextServerRq() {
 		serverRqCounter = (serverRqCounter % 99) + 1;
@@ -25,6 +29,21 @@ public class Server {
         try (DatagramSocket ds = new DatagramSocket(1234)) {
             byte[] receive = new byte[65535];
             System.out.println("UDP server listening on port 1234...");
+
+			//start heartbeat monitor thread (simple polling loop)
+			new Thread(() -> {
+				while (true) {
+					try { Thread.sleep(5000); } catch (InterruptedException ie) { return; }
+					long now = System.currentTimeMillis();
+					for (String name : peers.keySet()) {
+						Long last = lastHeartbeat.get(name);
+						if (last != null && now - last > HEARTBEAT_TIMEOUT_MS) {
+							System.out.printf("[HEARTBEAT] Peer '%s' timed out (last=%dms ago). Trigger recovery logic here.%n", name, (now - last));
+							// Placeholder: recovery / replication logic would be invoked here.
+						}
+					}
+				}
+			}, "heartbeat-monitor").start();
 
             while (true) {
                 DatagramPacket dpReceive = new DatagramPacket(receive, receive.length);
@@ -53,6 +72,32 @@ public class Server {
 							  .append(pd.getTcpPort());
 						}
 						sendSimple(ds, dpReceive, sb.toString());
+						receive = new byte[65535];
+						continue;
+					}
+
+					// heartbeat handling
+					if ("HEARTBEAT".equals(cmd)) {
+						// Expected: HEARTBEAT RQ# Name Number_Chunks Timestamp
+						if (parts.length < 5) {
+							System.out.println("Malformed HEARTBEAT frame: " + msg);
+							receive = new byte[65535];
+							continue;
+						}
+						int rq = safeInt(parts[1]);
+						String name = parts[2];
+						int numChunks = safeInt(parts[3]);
+						long tsClient = safeLong(parts[4]); // currently unused other than logging
+						PeerData pd = peers.get(name);
+						if (pd == null) {
+							System.out.printf("Heartbeat from unknown peer '%s' (rq=%d) ignored.%n", name, rq);
+							receive = new byte[65535];
+							continue;
+						}
+						long now = System.currentTimeMillis();
+						lastHeartbeat.put(name, now);
+						heartbeatChunkCounts.put(name, numChunks);
+						System.out.printf("[HEARTBEAT] name=%s rq=%d chunks=%d clientTs=%d serverTs=%d%n", name, rq, numChunks, tsClient, now);
 						receive = new byte[65535];
 						continue;
 					}
