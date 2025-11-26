@@ -34,10 +34,17 @@ public class PeerBackupRestore {
         DatagramPacket pkt = new DatagramPacket(data, data.length, ip, serverPort);
         ds.send(pkt);
 
-        byte[] bufList = new byte[4096];
-        DatagramPacket resp = new DatagramPacket(bufList, bufList.length);
-        ds.receive(resp);
-        String listResp = new String(resp.getData(), 0, resp.getLength()).trim();
+        String listResp = null;
+        try {
+            listResp = ResponseInbox.waitFor("PEERS", 3000);
+        } catch (InterruptedException e) {
+            System.out.println("LIST request interrupted");
+            return;
+        }
+        if (listResp == null) {
+            System.out.println("No response from server for LIST request");
+            return;
+        }
         System.out.println("Server: " + listResp);
 
         String[] listParts = listResp.split("\\s+");
@@ -73,10 +80,17 @@ public class PeerBackupRestore {
         byte[] data = req.getBytes();
         ds.send(new DatagramPacket(data, data.length, ip, serverPort));
 
-        byte[] b = new byte[2048];
-        DatagramPacket resp = new DatagramPacket(b, b.length);
-        ds.receive(resp);
-        String plan = new String(resp.getData(), 0, resp.getLength()).trim();
+        String plan = null;
+        try {
+            plan = ResponseInbox.waitFor("BACKUP_PLAN", 5000);
+        } catch (InterruptedException e) {
+            System.out.println("BACKUP_REQ interrupted");
+            return;
+        }
+        if (plan == null) {
+            System.out.println("No BACKUP_PLAN response from server");
+            return;
+        }
         System.out.println("Server response: " + plan);
 
         if (!plan.startsWith("BACKUP_PLAN")) return;
@@ -112,6 +126,13 @@ public class PeerBackupRestore {
         int numChunks = (int) Math.ceil((double) size / chunkSize);
         System.out.printf("Backing up file to storage peer %s at %s:%d (fileSize=%d, chunkSize=%d, numChunks=%d)\n",
                 targetPeerName, targetIp, targetTcp, size, chunkSize, numChunks);
+
+        // Give server time to send all STORE_REQ messages 
+        System.out.printf("Waiting 5000ms for server to send %d STORE_REQ messages...%n", numChunks);
+        try {
+            Thread.sleep(5000);
+        } catch (InterruptedException e) {
+        }
 
         try (FileInputStream mainFis = new FileInputStream(f)) {
             for (int chunkId = 0; chunkId < numChunks; chunkId++) {
@@ -151,29 +172,84 @@ public class PeerBackupRestore {
                     
                     System.out.printf("Chunk %d/%d sent (size=%d bytes, checksum=%d)\n",
                             chunkId + 1, numChunks, totalRead, chunkChecksum);
+                    // Small pacing to avoid outrunning STORE_REQ bursts from server
+                    try { Thread.sleep(25); } catch (InterruptedException ie) {}
                 } catch (IOException e) {
                     System.err.printf("Chunk %d send failed: %s\n", chunkId, e.getMessage());
                     return; // Abort backup on failure
                 }
 
-                // Wait for CHUNK_OK for this chunk
+                // Wait for CHUNK_OK or CHUNK_ERROR for this chunk (with retry)
                 boolean chunkOk = false;
-                try {
-                    ds.setSoTimeout(3000);
-                    byte[] ackBuf = new byte[512];
-                    DatagramPacket ackPkt = new DatagramPacket(ackBuf, ackBuf.length);
-                    ds.receive(ackPkt);
-                    String ack = new String(ackPkt.getData(), 0, ackPkt.getLength()).trim();
-                    System.out.printf("Chunk %d ack: %s\n", chunkId, ack);
-                    if (ack.startsWith("CHUNK_OK")) chunkOk = true;
-                } catch (Exception timeout) {
-                    System.out.printf("No CHUNK_OK received for chunk %d within timeout\n", chunkId);
-                } finally {
-                    ds.setSoTimeout(0);
+                int retryCount = 0;
+                int maxRetries = 3;
+                
+                while (!chunkOk && retryCount < maxRetries) {
+                    try {
+                        // Wait for either CHUNK_OK or CHUNK_ERROR (whichever comes first)
+                        long startTime = System.currentTimeMillis();
+                        String ack = null;
+                        
+                        // Poll both inboxes with a total timeout of 3000ms
+                        while (ack == null && (System.currentTimeMillis() - startTime) < 3000) {
+                            ack = ResponseInbox.waitFor("CHUNK_OK", 100);
+                            if (ack == null) {
+                                ack = ResponseInbox.waitFor("CHUNK_ERROR", 100);
+                            }
+                        }
+                        
+                        if (ack != null) {
+                            System.out.printf("Chunk %d response: %s\n", chunkId, ack);
+                            // Parse the response to verify it's for THIS chunk
+                            String[] ackParts = ack.split("\\s+");
+                            if (ackParts.length >= 4) {
+                                int ackChunkId = safeInt(ackParts[3]);
+                                if (ackChunkId != chunkId) {
+                                    System.out.printf("DEBUG: Received response for chunk %d but waiting for chunk %d, ignoring%n", ackChunkId, chunkId);
+                                    continue; // Wrong chunk, keep waiting
+                                }
+                            }
+                            if (ack.startsWith("CHUNK_OK")) {
+                                chunkOk = true;
+                                break;
+                            } else if (ack.startsWith("CHUNK_ERROR") && ack.contains("NoStoreReq")) {
+                                // NoStoreReq error - storage peer hasn't received STORE_REQ yet
+                                retryCount++;
+                                System.out.printf("Chunk %d rejected (NoStoreReq), waiting 1s and retrying... (attempt %d/%d)\n", 
+                                    chunkId, retryCount, maxRetries);
+                                Thread.sleep(1000);
+                                
+                                if (retryCount < maxRetries) {
+                                    // Resend the chunk
+                                    try (Socket sock = new Socket(targetIp, targetTcp);
+                                         OutputStream out = sock.getOutputStream()) {
+                                        int rqRetry = nextRq();
+                                        String header = String.format("SEND_CHUNK %02d %s %d %d %d\n",
+                                                rqRetry, fileName, chunkId, totalRead, chunkChecksum);
+                                        out.write(header.getBytes());
+                                        out.write(chunkData, 0, totalRead);
+                                        out.flush();
+                                        System.out.printf("Chunk %d resent (attempt %d/%d)\n", chunkId, retryCount, maxRetries);
+                                    }
+                                }
+                                continue;
+                            } else {
+                                // Other error (checksum mismatch, etc.), fail immediately
+                                System.err.printf("Chunk %d failed with error: %s\n", chunkId, ack);
+                                break;
+                            }
+                        } else {
+                            System.out.printf("No response received for chunk %d within timeout\n", chunkId);
+                            retryCount++;
+                        }
+                    } catch (InterruptedException timeout) {
+                        System.out.printf("Wait interrupted for chunk %d\n", chunkId);
+                        break;
+                    }
                 }
 
                 if (!chunkOk) {
-                    System.err.printf("Backup failed: chunk %d was not acknowledged\n", chunkId);
+                    System.err.printf("Backup failed: chunk %d was not acknowledged after %d attempts\n", chunkId, retryCount);
                     return;
                 }
             }
@@ -209,10 +285,17 @@ public class PeerBackupRestore {
         byte[] reqData = req.getBytes();
         ds.send(new DatagramPacket(reqData, reqData.length, ip, serverPort));
 
-        byte[] restorebuf = new byte[2048];
-        DatagramPacket resp = new DatagramPacket(restorebuf, restorebuf.length);
-        ds.receive(resp);
-        String respMsg = new String(resp.getData(), 0, resp.getLength()).trim();
+        String respMsg = null;
+        try {
+            respMsg = ResponseInbox.waitFor("RESTORE_PLAN", 5000);
+        } catch (InterruptedException e) {
+            System.out.println("RESTORE_REQ interrupted");
+            return;
+        }
+        if (respMsg == null) {
+            System.out.println("No response from server for RESTORE_REQ");
+            return;
+        }
         System.out.println("Server: " + respMsg);
 
         if (respMsg.startsWith("RESTORE_FAIL")) return;

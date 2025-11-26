@@ -11,6 +11,7 @@ import peer.PeerData;
 public class ServerMessageHandler {
 
     private static int serverRqCounter = 0;
+    private static int storageSelectionIndex = 0; // Round-robin counter for storage peer selection
 
     private static int nextServerRq() {
         serverRqCounter = (serverRqCounter % 99) + 1;
@@ -110,36 +111,65 @@ public class ServerMessageHandler {
                 sendSimple(ds, dpReceive, String.format("BACKUP-DENIED %02d REASON: NotRegistered", rq));
                 return;
             }
-            //Select a storage peer not the owner tho
-            PeerData chosen = null;
+            //Select a storage peer using round-robin (not the owner)
+            java.util.List<PeerData> eligiblePeers = new java.util.ArrayList<>();
             for (PeerData pd : peers.values()) {
                 if (!pd.getName().equals(owner) && !"OWNER".equalsIgnoreCase(pd.getRole())) {
-                    chosen = pd; break;
+                    eligiblePeers.add(pd);
                 }
             }
-            if (chosen == null) {
+            
+            if (eligiblePeers.isEmpty()) {
                 sendSimple(ds, dpReceive, String.format("BACKUP-DENIED %02d REASON: NoStoragePeer", rq));
                 return;
             }
+            
+            // ound-robin selection
+            PeerData chosen = eligiblePeers.get(storageSelectionIndex % eligiblePeers.size());
+            storageSelectionIndex++;
+            System.out.printf("Selected storage peer %s (%d of %d available)%n", 
+                chosen.getName(), (storageSelectionIndex % eligiblePeers.size()) + 1, eligiblePeers.size());
             int chunkSize = 4096; //fixed size for now
-            int chunkId = 0;
+
+            //Calculate number of chunks
+            int numChunks = (int) Math.ceil((double) fileSize / chunkSize);
 
             //Peer list
             String peerList = "[" + chosen.getName() + "]";
             String plan = String.format("BACKUP_PLAN %02d %s %s %d", rq, fileName, peerList, chunkSize);
-            System.out.printf("BACKUP_REQ(rq=%02d file=%s size=%d checksum=%d owner=%s) -> %s%n", rq, fileName, fileSize, checksum, owner, plan);
+            System.out.printf("BACKUP_REQ(rq=%02d file=%s size=%d checksum=%d owner=%s numChunks=%d) -> %s%n", 
+                rq, fileName, fileSize, checksum, owner, numChunks, plan);
             sendSimple(ds, dpReceive, plan);
 
-            //Send STORE_REQ notification to selected storage peer
-            int serverRq = nextServerRq();
-            String storeReq = String.format("STORE_REQ %02d %s %d %s", serverRq, fileName, chunkId, owner);
-            System.out.printf("Sending STORE_REQ to %s: %s%n", chosen.getName(), storeReq);
-            byte[] d = storeReq.getBytes();
-            ds.send(new DatagramPacket(d, d.length, chosen.getIp(), chosen.getUdpPort()));
-
-            // Initialize backup table entry
+            // Initialize backup table entry IMMEDIATELY so CHUNK_OK handler can find it
             String backupKey = owner + ":" + fileName;
             backupTable.put(backupKey, new java.util.ArrayList<>());
+            System.out.printf("Created backupTable entry: %s%n", backupKey);
+
+            // Prime: send STORE_REQ for chunk 0 first to avoid race with first TCP SEND_CHUNK
+            if (numChunks > 0) {
+                int serverRq0 = nextServerRq();
+                String storeReq0 = String.format("STORE_REQ %02d %s %d %s", serverRq0, fileName, 0, owner);
+                System.out.printf("Priming STORE_REQ to %s: %s%n", chosen.getName(), storeReq0);
+                byte[] d0 = storeReq0.getBytes();
+                ds.send(new DatagramPacket(d0, d0.length, chosen.getIp(), chosen.getUdpPort()));
+                // Duplicate send to improve reliability of UDP delivery
+                try { Thread.sleep(100); } catch (InterruptedException ignore) {}
+                ds.send(new DatagramPacket(d0, d0.length, chosen.getIp(), chosen.getUdpPort()));
+                try { Thread.sleep(150); } catch (InterruptedException ignore) {}
+            }
+
+            // Send remaining STORE_REQ (starting from 1)
+            for (int chunkId = 1; chunkId < numChunks; chunkId++) {
+                int serverRq = nextServerRq();
+                String storeReq = String.format("STORE_REQ %02d %s %d %s", serverRq, fileName, chunkId, owner);
+                System.out.printf("Sending STORE_REQ to %s: %s%n", chosen.getName(), storeReq);
+                byte[] d = storeReq.getBytes();
+                // Send twice for reliability
+                ds.send(new DatagramPacket(d, d.length, chosen.getIp(), chosen.getUdpPort()));
+                try { Thread.sleep(50); } catch (InterruptedException ignore) {}
+                ds.send(new DatagramPacket(d, d.length, chosen.getIp(), chosen.getUdpPort()));
+            }
 
             return;
         }
@@ -150,12 +180,15 @@ public class ServerMessageHandler {
             //Extract file name from message to find owner
             if (parts.length >= 3) {
                 String fileNameAck = parts[2];
+                System.out.printf("DEBUG: Looking for owner of file '%s' in backupTable (keys=%s)%n", fileNameAck, backupTable.keySet());
                 //Find owner peer for this file
                 PeerData ownerPeer = null;
                 for (String key : backupTable.keySet()) {
+                    System.out.printf("DEBUG: Checking key '%s' endsWith ':%s' = %b%n", key, fileNameAck, key.endsWith(":" + fileNameAck));
                     if (key.endsWith(":" + fileNameAck)) {
                         String ownerName = key.substring(0, key.indexOf(":"));
                         ownerPeer = peers.get(ownerName);
+                        System.out.printf("DEBUG: Found owner '%s', peer=%s%n", ownerName, ownerPeer);
                         break;
                     }
                 }
@@ -164,6 +197,8 @@ public class ServerMessageHandler {
                     byte[] fwdData = msg.getBytes();
                     ds.send(new DatagramPacket(fwdData, fwdData.length, ownerPeer.getIp(), ownerPeer.getUdpPort()));
                     System.out.printf("Forwarded %s to owner %s%n", cmd, ownerPeer.getName());
+                } else {
+                    System.err.printf("ERROR: Could not find owner for file '%s' (backupTable has %d entries)%n", fileNameAck, backupTable.size());
                 }
             }
             return;

@@ -41,45 +41,7 @@ public class PeerUDP{
         String name = sc.nextLine().trim();
         sendRegistration(ds, ip, serverPort, name, "BOTH", tcpPort, 1024);
 
-        
-        Thread udpListener = new Thread(() -> {
-            try {
-                byte[] receiveBuffer = new byte[65535];
-                DatagramPacket receivePacket = new DatagramPacket(receiveBuffer, receiveBuffer.length);
-                while (!Thread.currentThread().isInterrupted()) {
-                    ds.receive(receivePacket);
-                    //Dispatch processing to worker pool to keep listener responsive
-                    workers.submit(() -> {
-                        String msg = new String(receivePacket.getData(), 0, receivePacket.getLength()).trim();
-                        System.out.printf("Peer received: '%s' from %s:%d%n", msg,
-                                receivePacket.getAddress().getHostAddress(), receivePacket.getPort());
-                        try {
-                            if (msg.startsWith("STORE_REQ")) {
-                                // STORE_REQ RQ# fileName chunkId ownerName
-                                String[] parts = msg.split("\\s+");
-                                if (parts.length >= 5) {
-                                    String fileName = parts[2];
-                                    String chunkId = parts[3];
-                                    expectedStoreReqs.put(fileName + ":" + chunkId, parts[4]);
-                                    System.out.printf("STORE_REQ recorded for %s:%s (owner=%s)%n", fileName, chunkId, parts[4]);
-                                }
-                            } else if (msg.startsWith("CHUNK_OK") || msg.startsWith("CHUNK_ERROR") || msg.startsWith("STORE_ACK")) {
-                                System.out.println("Server forwarded: " + msg);
-                            } else if (msg.startsWith("PEERS ")) {
-                                System.out.println("Peer list received");
-                            }
-                        } catch (Exception ex) {
-                            System.err.println("Peer message handle error: " + ex.getMessage());
-                        }
-                    });
-                }
-            } catch (IOException ioe) {
-                System.out.println("UDP listener stopped: " + ioe.getMessage());
-            }
-        }, "peer-udp-listener");
-        udpListener.setDaemon(true);
-        udpListener.start();
-        //Receive server response
+        // Block for initial registration response BEFORE starting async listener
         byte[] receiveBuffer = new byte[65535];
         DatagramPacket receivePacket = new DatagramPacket(receiveBuffer, receiveBuffer.length);
         ds.receive(receivePacket);
@@ -95,6 +57,52 @@ public class PeerUDP{
         } else if (response.startsWith("REGISTERED") || response.startsWith("REGISTER-ACCEPTED")) {
             System.out.println("Registration accepted by server.");
         }
+
+        Thread udpListener = new Thread(() -> {
+            try {
+                byte[] asyncBuf = new byte[65535];
+                DatagramPacket asyncPkt = new DatagramPacket(asyncBuf, asyncBuf.length);
+                while (!Thread.currentThread().isInterrupted()) {
+                    ds.receive(asyncPkt);
+                    //Dispatch processing to worker pool to keep listener responsive
+                    workers.submit(() -> {
+                        String msg = new String(asyncPkt.getData(), 0, asyncPkt.getLength()).trim();
+                        System.out.printf("Peer received: '%s' from %s:%d%n", msg,
+                                asyncPkt.getAddress().getHostAddress(), asyncPkt.getPort());
+                        try {
+                            if (msg.startsWith("STORE_REQ")) {
+                                // STORE_REQ RQ# fileName chunkId ownerName
+                                String[] parts = msg.split("\\s+");
+                                if (parts.length >= 5) {
+                                    String fileName = parts[2];
+                                    String chunkId = parts[3];
+                                    expectedStoreReqs.put(fileName + ":" + chunkId, parts[4]);
+                                    System.out.printf("STORE_REQ recorded for %s:%s (owner=%s)%n", fileName, chunkId, parts[4]);
+                                }
+                            } else if (msg.startsWith("BACKUP_PLAN")) {
+                                ResponseInbox.deposit("BACKUP_PLAN", msg);
+                            } else if (msg.startsWith("CHUNK_OK")) {
+                                ResponseInbox.deposit("CHUNK_OK", msg);
+                            } else if (msg.startsWith("CHUNK_ERROR")) {
+                                ResponseInbox.deposit("CHUNK_ERROR", msg);
+                            } else if (msg.startsWith("STORE_ACK")) {
+                                System.out.println("Server forwarded: " + msg);
+                            } else if (msg.startsWith("PEERS ")) {
+                                ResponseInbox.deposit("PEERS", msg);
+                            } else if (msg.startsWith("RESTORE_PLAN") || msg.startsWith("RESTORE_FAIL")) {
+                                ResponseInbox.deposit("RESTORE_PLAN", msg);
+                            }
+                        } catch (Exception ex) {
+                            System.err.println("Peer message handle error: " + ex.getMessage());
+                        }
+                    });
+                }
+            } catch (IOException ioe) {
+                System.out.println("UDP listener stopped: " + ioe.getMessage());
+            }
+        }, "peer-udp-listener");
+        udpListener.setDaemon(true);
+        udpListener.start();
 
         //heartbeat integration
         IntSupplier chunkCountSupplier = () -> {
@@ -119,6 +127,10 @@ public class PeerUDP{
         TcpChunkServer.startTcpChunkServer(tcpServerSocket, ds, ip, serverPort, name, expectedStoreReqs);
 
         while(true){
+            if (!sc.hasNextLine()) {
+                System.out.println("Input stream closed. Exiting.");
+                break;
+            }
             String inp = sc.nextLine();
 
             if (inp.equalsIgnoreCase("de")){
