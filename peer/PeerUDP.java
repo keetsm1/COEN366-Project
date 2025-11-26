@@ -7,6 +7,8 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.util.Scanner;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntSupplier;
 
@@ -27,6 +29,8 @@ public class PeerUDP{
         String serverHost = ip.getHostAddress(); // Assuming server is on localhost
         HeartbeatService heartbeatService = null;
 
+        ExecutorService workers = Executors.newFixedThreadPool(6);
+
         //Create TCP server socket with random port 0 means it will auto assign an available port
         ServerSocket tcpServerSocket = new ServerSocket(0);
         int tcpPort = tcpServerSocket.getLocalPort();
@@ -37,6 +41,44 @@ public class PeerUDP{
         String name = sc.nextLine().trim();
         sendRegistration(ds, ip, serverPort, name, "BOTH", tcpPort, 1024);
 
+        
+        Thread udpListener = new Thread(() -> {
+            try {
+                byte[] receiveBuffer = new byte[65535];
+                DatagramPacket receivePacket = new DatagramPacket(receiveBuffer, receiveBuffer.length);
+                while (!Thread.currentThread().isInterrupted()) {
+                    ds.receive(receivePacket);
+                    //Dispatch processing to worker pool to keep listener responsive
+                    workers.submit(() -> {
+                        String msg = new String(receivePacket.getData(), 0, receivePacket.getLength()).trim();
+                        System.out.printf("Peer received: '%s' from %s:%d%n", msg,
+                                receivePacket.getAddress().getHostAddress(), receivePacket.getPort());
+                        try {
+                            if (msg.startsWith("STORE_REQ")) {
+                                // STORE_REQ RQ# fileName chunkId ownerName
+                                String[] parts = msg.split("\\s+");
+                                if (parts.length >= 5) {
+                                    String fileName = parts[2];
+                                    String chunkId = parts[3];
+                                    expectedStoreReqs.put(fileName + ":" + chunkId, parts[4]);
+                                    System.out.printf("STORE_REQ recorded for %s:%s (owner=%s)%n", fileName, chunkId, parts[4]);
+                                }
+                            } else if (msg.startsWith("CHUNK_OK") || msg.startsWith("CHUNK_ERROR") || msg.startsWith("STORE_ACK")) {
+                                System.out.println("Server forwarded: " + msg);
+                            } else if (msg.startsWith("PEERS ")) {
+                                System.out.println("Peer list received");
+                            }
+                        } catch (Exception ex) {
+                            System.err.println("Peer message handle error: " + ex.getMessage());
+                        }
+                    });
+                }
+            } catch (IOException ioe) {
+                System.out.println("UDP listener stopped: " + ioe.getMessage());
+            }
+        }, "peer-udp-listener");
+        udpListener.setDaemon(true);
+        udpListener.start();
         //Receive server response
         byte[] receiveBuffer = new byte[65535];
         DatagramPacket receivePacket = new DatagramPacket(receiveBuffer, receiveBuffer.length);
