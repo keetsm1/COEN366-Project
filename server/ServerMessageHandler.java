@@ -115,7 +115,11 @@ public class ServerMessageHandler {
             java.util.List<PeerData> eligiblePeers = new java.util.ArrayList<>();
             for (PeerData pd : peers.values()) {
                 if (!pd.getName().equals(owner) && !"OWNER".equalsIgnoreCase(pd.getRole())) {
-                    eligiblePeers.add(pd);
+                	int storage = Integer.parseInt(pd.getStorage().replace("MB", ""));
+                	if(storage >= fileSize) {
+                		sendtoSpecificPeer(ds, pd, String.format("STORAGE_TASK %02d %s %d %s", rq, fileName, fileSize, owner));
+                        eligiblePeers.add(pd);
+                	}
                 }
             }
             
@@ -124,7 +128,7 @@ public class ServerMessageHandler {
                 return;
             }
             
-            // ound-robin selection
+            // Round-robin selection
             PeerData chosen = eligiblePeers.get(storageSelectionIndex % eligiblePeers.size());
             storageSelectionIndex++;
             System.out.printf("Selected storage peer %s (%d of %d available)%n", 
@@ -368,7 +372,11 @@ public class ServerMessageHandler {
         byte[] d = text.getBytes();
         ds.send(new DatagramPacket(d, d.length, req.getAddress(), req.getPort()));
     }
-
+    private static void sendtoSpecificPeer(DatagramSocket ds, PeerData peer, String text) throws IOException {
+        byte[] d = text.getBytes();
+        ds.send(new DatagramPacket(d, d.length, peer.getIp(), peer.getUdpPort()));
+    }
+    
     public static void acceptRegistration(DatagramSocket socket, InetAddress clientAddr, int serverPort, String name,
                                           int tcpPort, int storageCapacity, int rq) throws IOException {
         //int udpPort = socket.getLocalPort();
