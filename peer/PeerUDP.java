@@ -91,6 +91,64 @@ public class PeerUDP{
                                 ResponseInbox.deposit("PEERS", msg);
                             } else if (msg.startsWith("RESTORE_PLAN") || msg.startsWith("RESTORE_FAIL")) {
                                 ResponseInbox.deposit("RESTORE_PLAN", msg);
+                            } else if (msg.startsWith("REPLICATE_REQ")) {
+                                // REPLICATE_REQ RQ# fileName chunkId targetName targetIP targetTCP
+                                String[] p = msg.split("\\s+");
+                                workers.submit(() -> {
+                                    try {
+                                        String fileName = p[2];
+                                        String chunkId = p[3];
+                                        String targetName = p[4];
+                                        String targetIP = p[5];
+                                        int targetTCP = Integer.parseInt(p[6]);
+                                        
+                                        // Search for chunk in old or new format
+                                        File chunk = null;
+                                        File storageDir = new File("storage");
+                                        
+                                        // Try root directory first (old format)
+                                        chunk = new File(storageDir, fileName + "." + chunkId + ".part");
+                                        
+                                        if (!chunk.exists()) {
+                                            // Search in owner subdirectories
+                                            File[] dirs = storageDir.listFiles(File::isDirectory);
+                                            if (dirs != null) {
+                                                for (File dir : dirs) {
+                                                    // Try old format
+                                                    chunk = new File(dir, fileName + "." + chunkId + ".part");
+                                                    if (chunk.exists()) break;
+                                                    
+                                                    // Try new format: O_*_S_*_fileName.chunkId.part
+                                                    File[] matches = dir.listFiles((d, n) -> 
+                                                        n.endsWith("_" + fileName + "." + chunkId + ".part"));
+                                                    if (matches != null && matches.length > 0) {
+                                                        chunk = matches[0];
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
+                                        if (chunk == null || !chunk.exists()) {
+                                            System.err.printf("Replication failed: chunk not found %s.%s%n", fileName, chunkId);
+                                            return;
+                                        }
+                                        
+                                        byte[] data = java.nio.file.Files.readAllBytes(chunk.toPath());
+                                        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+                                        crc.update(data);
+                                        
+                                        // Send chunk via TCP (uses RQ# 99 which bypasses STORE_REQ check)
+                                        try (java.net.Socket s = new java.net.Socket(targetIP, targetTCP)) {
+                                            s.getOutputStream().write(
+                                                String.format("SEND_CHUNK 99 %s %s %d %d\n", fileName, chunkId, data.length, crc.getValue()).getBytes());
+                                            s.getOutputStream().write(data);
+                                            System.out.printf("✓ Replicated chunk %s:%s to %s%n", fileName, chunkId, targetName);
+                                        }
+                                    } catch (Exception e) {
+                                        System.err.println("Replication error: " + e.getMessage());
+                                    }
+                                });
                             }
                         } catch (Exception ex) {
                             System.err.println("Peer message handle error: " + ex.getMessage());
@@ -113,7 +171,7 @@ public class PeerUDP{
             }
             return 0;
         };
-        int heartbeatInterval = 60; // sending heartbeat every 60 secs. used to be 10 but too much spam in console.
+        int heartbeatInterval = 30; // sending heartbeat every 10 secs
         heartbeatService = new HeartbeatService(name, ds, serverHost, serverPort, heartbeatInterval, rqCounter, chunkCountSupplier);
         heartbeatService.start();
         System.out.println("Heartbeat service started.");

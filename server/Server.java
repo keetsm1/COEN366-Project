@@ -16,7 +16,6 @@ public class Server {
     // Heartbeat tracking: last received time (server clock) and reported chunk counts
     private static java.util.Map<String, Long> lastHeartbeat = new java.util.concurrent.ConcurrentHashMap<>();
     private static java.util.Map<String, Integer> heartbeatChunkCounts = new java.util.concurrent.ConcurrentHashMap<>();
-    private static final long HEARTBEAT_TIMEOUT_MS = 60000; // 60s timeout
 
     public static void main(String[] args) throws IOException {
         peers = new HashMap<>();
@@ -27,20 +26,8 @@ public class Server {
         try (DatagramSocket ds = new DatagramSocket(1234)) {
             System.out.println("UDP server listening on port 1234...");
 
-            // start heartbeat monitor thread (simple polling loop)
-            new Thread(() -> {
-                while (true) {
-                    try { Thread.sleep(5000); } catch (InterruptedException ie) { return; }
-                    long now = System.currentTimeMillis();
-                    for (String name : peers.keySet()) {
-                        Long last = lastHeartbeat.get(name);
-                        if (last != null && now - last > HEARTBEAT_TIMEOUT_MS) {
-                            System.out.printf("[HEARTBEAT] Peer '%s' timed out (last=%dms ago). Trigger recovery logic here.%n",
-                                    name, (now - last));
-                        }
-                    }
-                }
-            }, "heartbeat-monitor").start();
+            // start heartbeat monitor with failure detection
+            FailureDetector.start(ds, peers, backupTable, lastHeartbeat);
 
             // main receive loop; hand off processing to worker threads
             while (true) {

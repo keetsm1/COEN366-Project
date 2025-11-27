@@ -55,8 +55,11 @@ public class TcpChunkServer {
                             String storeKey = fileName + ":" + chunkId;
                             String ownerName = expectedStoreReqs.get(storeKey);
                             
-                            //wait up to 3000ms for STORE_REQ to arrive
-                            if (ownerName == null) {
+                            //Skip STORE_REQ wait for replication requests (RQ# 99)
+                            boolean isReplication = (rq == 99);
+                            
+                            //wait up to 5000ms for STORE_REQ to arrive (unless replication)
+                            if (ownerName == null && !isReplication) {
                                 long start = System.currentTimeMillis();
                                 while (ownerName == null && (System.currentTimeMillis() - start) < 5000) {
                                     try { Thread.sleep(100); } catch (InterruptedException ie) { break; }
@@ -70,12 +73,36 @@ public class TcpChunkServer {
                                     continue;
                                 }
                             }
+                            
+                            //For replication, extract owner from existing chunk filename
+                            if (isReplication && ownerName == null) {
+                                // Try to find existing chunk to determine owner
+                                File storageRoot = new File("storage");
+                                if (storageRoot.exists()) {
+                                    File[] ownerDirs = storageRoot.listFiles(File::isDirectory);
+                                    if (ownerDirs != null) {
+                                        for (File dir : ownerDirs) {
+                                            File[] chunks = dir.listFiles((d, n) -> n.contains(fileName));
+                                            if (chunks != null && chunks.length > 0) {
+                                                ownerName = dir.getName();
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (ownerName == null) {
+                                    ownerName = "REPLICATED"; // Fallback for replicated chunks
+                                }
+                            }
 
                             //Store under storage/<ownerName>/
+                            // Filename format: O_<ownerName>_S_<saverName>_<fileName>.<chunkId>.part
                             File baseDir = new File("storage");
                             File ownerDir = new File(baseDir, ownerName);
                             ownerDir.mkdirs();
-                            File outFile = new File(ownerDir, fileName + "." + chunkId + ".part");
+                            String chunkFileName = String.format("O_%s_S_%s_%s.%d.part", 
+                                                                 ownerName, selfName, fileName, chunkId);
+                            File outFile = new File(ownerDir, chunkFileName);
 
                             CRC32 crc = new CRC32();
                             int actualBytesReceived = 0;
@@ -126,18 +153,37 @@ public class TcpChunkServer {
                             int chunkId  = safeInt(h[3]);
 
                             // Locate chunk in storage root or any owner subfolder
-                            File inFile = new File("storage", fileName + "." + chunkId + ".part");
+                            // Search for both old format and new format (O_*_S_*_fileName.chunkId.part)
+                            File inFile = null;
+                            File baseDir = new File("storage");
+                            
+                            //First try old format
+                            inFile = new File(baseDir, fileName + "." + chunkId + ".part");
+                            
+                            // Search in owner subdirectories
                             if (!inFile.exists()) {
-                                File baseDir = new File("storage");
                                 File[] owners = baseDir.listFiles(File::isDirectory);
                                 if (owners != null) {
                                     for (File od : owners) {
+                                        // Try old format
                                         File candidate = new File(od, fileName + "." + chunkId + ".part");
-                                        if (candidate.exists()) { inFile = candidate; break; }
+                                        if (candidate.exists()) { 
+                                            inFile = candidate; 
+                                            break; 
+                                        }
+                                        
+                                        // Try new format: O_*_S_*_fileName.chunkId.part
+                                        File[] chunks = od.listFiles((dir, name) -> 
+                                            name.endsWith("_" + fileName + "." + chunkId + ".part"));
+                                        if (chunks != null && chunks.length > 0) {
+                                            inFile = chunks[0];
+                                            break;
+                                        }
                                     }
                                 }
                             }
-                            if (!inFile.exists()) {
+                            
+                            if (inFile == null || !inFile.exists()) {
                                 System.out.println("Requested chunk not found anywhere: " + fileName + "." + chunkId + ".part");
                                 continue;
                             }

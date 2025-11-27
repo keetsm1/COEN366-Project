@@ -106,28 +106,31 @@ public class PeerBackupRestore {
         String[] peerNames = peerListContent.split(",\\s*");
         if (peerNames.length == 0) { System.out.println("No peers in BACKUP_PLAN"); return; }
 
-        String targetPeerName = peerNames[0];
-        PeerData targetPeer = knownPeers.get(targetPeerName);
-
-        // fallback: refresh LIST
-        if (targetPeer == null) {
-            handleListRequest(ds, ip, serverPort, knownPeers);
-            targetPeer = knownPeers.get(targetPeerName);
-            if (targetPeer == null) {
-                System.out.println("Peer " + targetPeerName + " still not found.");
-                return;
+        // Populate all target peers from the list
+        PeerData[] targetPeers = new PeerData[peerNames.length];
+        for (int i = 0; i < peerNames.length; i++) {
+            targetPeers[i] = knownPeers.get(peerNames[i]);
+            if (targetPeers[i] == null) {
+                // fallback: refresh LIST
+                handleListRequest(ds, ip, serverPort, knownPeers);
+                targetPeers[i] = knownPeers.get(peerNames[i]);
+                if (targetPeers[i] == null) {
+                    System.out.println("Peer " + peerNames[i] + " not found.");
+                    return;
+                }
             }
         }
 
-        String targetIp = targetPeer.getIp().getHostAddress();
-        int targetTcp = targetPeer.getTcpPort();
-
         // Calculate number of chunks needed for the entire file
         int numChunks = (int) Math.ceil((double) size / chunkSize);
-        System.out.printf("Backing up file to storage peer %s at %s:%d (fileSize=%d, chunkSize=%d, numChunks=%d)\n",
-                targetPeerName, targetIp, targetTcp, size, chunkSize, numChunks);
+        System.out.printf("Backing up file to %d storage peers (fileSize=%d, chunkSize=%d, numChunks=%d)\n",
+                targetPeers.length, size, chunkSize, numChunks);
+        for (int i = 0; i < targetPeers.length; i++) {
+            System.out.printf("  Peer %d: %s at %s:%d\n", i + 1, peerNames[i], 
+                targetPeers[i].getIp().getHostAddress(), targetPeers[i].getTcpPort());
+        }
 
-        // Give server time to send all STORE_REQ messages 
+        // Wait a moment for server to send STORE_REQ messages 
         System.out.printf("Waiting 5000ms for server to send %d STORE_REQ messages...%n", numChunks);
         try {
             Thread.sleep(5000);
@@ -136,11 +139,16 @@ public class PeerBackupRestore {
 
         try (FileInputStream mainFis = new FileInputStream(f)) {
             for (int chunkId = 0; chunkId < numChunks; chunkId++) {
-                // Calculate this chunk's size
+                //Round-robin: select target peer for this chunk
+                PeerData targetPeer = targetPeers[chunkId % targetPeers.length];
+                String targetIp = targetPeer.getIp().getHostAddress();
+                int targetTcp = targetPeer.getTcpPort();
+                
+                //calculate this chunk's size
                 long remainingFileBytes = size - ((long) chunkId * chunkSize);
                 int thisChunkSize = (int) Math.min(remainingFileBytes, chunkSize);
 
-                // Read chunk data and calculate checksum
+                //read chunk data and calculate checksum
                 byte[] chunkData = new byte[thisChunkSize];
                 int totalRead = 0;
                 while (totalRead < thisChunkSize) {
@@ -154,12 +162,12 @@ public class PeerBackupRestore {
                             chunkId, thisChunkSize, totalRead);
                 }
 
-                // Calculate checksum for this chunk
+                //Calculate checksum for this chunk
                 CRC32 chunkCrc = new CRC32();
                 chunkCrc.update(chunkData, 0, totalRead);
                 long chunkChecksum = chunkCrc.getValue();
 
-                // Send this chunk via TCP
+                //Send this chunk via TCP 
                 try (Socket sock = new Socket(targetIp, targetTcp);
                      OutputStream out = sock.getOutputStream()) {
 
@@ -170,27 +178,25 @@ public class PeerBackupRestore {
                     out.write(chunkData, 0, totalRead);
                     out.flush();
                     
-                    System.out.printf("Chunk %d/%d sent (size=%d bytes, checksum=%d)\n",
-                            chunkId + 1, numChunks, totalRead, chunkChecksum);
+                    System.out.printf("Chunk %d/%d sent to %s (size=%d bytes, checksum=%d)\n",
+                            chunkId + 1, numChunks, peerNames[chunkId % targetPeers.length], totalRead, chunkChecksum);
                     // Small pacing to avoid outrunning STORE_REQ bursts from server
                     try { Thread.sleep(25); } catch (InterruptedException ie) {}
                 } catch (IOException e) {
-                    System.err.printf("Chunk %d send failed: %s\n", chunkId, e.getMessage());
-                    return; // Abort backup on failure
+                    System.err.printf("Chunk %d send to %s failed: %s\n", chunkId, peerNames[chunkId % targetPeers.length], e.getMessage());
+                    return;
                 }
 
-                // Wait for CHUNK_OK or CHUNK_ERROR for this chunk (with retry)
+                //wait for CHUNK_OK or CHUNK_ERROR for this chunk (with retry)
                 boolean chunkOk = false;
                 int retryCount = 0;
                 int maxRetries = 3;
                 
                 while (!chunkOk && retryCount < maxRetries) {
                     try {
-                        // Wait for either CHUNK_OK or CHUNK_ERROR (whichever comes first)
                         long startTime = System.currentTimeMillis();
                         String ack = null;
                         
-                        // Poll both inboxes with a total timeout of 3000ms
                         while (ack == null && (System.currentTimeMillis() - startTime) < 3000) {
                             ack = ResponseInbox.waitFor("CHUNK_OK", 100);
                             if (ack == null) {
@@ -205,7 +211,6 @@ public class PeerBackupRestore {
                             if (ackParts.length >= 4) {
                                 int ackChunkId = safeInt(ackParts[3]);
                                 if (ackChunkId != chunkId) {
-                                    System.out.printf("DEBUG: Received response for chunk %d but waiting for chunk %d, ignoring%n", ackChunkId, chunkId);
                                     continue; // Wrong chunk, keep waiting
                                 }
                             }
@@ -218,10 +223,13 @@ public class PeerBackupRestore {
                                 System.out.printf("Chunk %d rejected (NoStoreReq), waiting 1s and retrying... (attempt %d/%d)\n", 
                                     chunkId, retryCount, maxRetries);
                                 Thread.sleep(1000);
-                                
+                                //3 retries to send the chunk in case it didnt work and had chunkerror
                                 if (retryCount < maxRetries) {
-                                    // Resend the chunk
-                                    try (Socket sock = new Socket(targetIp, targetTcp);
+                                    PeerData retryPeer = targetPeers[chunkId % targetPeers.length];
+                                    String retryIp = retryPeer.getIp().getHostAddress();
+                                    int retryTcp = retryPeer.getTcpPort();
+                                    
+                                    try (Socket sock = new Socket(retryIp, retryTcp);
                                          OutputStream out = sock.getOutputStream()) {
                                         int rqRetry = nextRq();
                                         String header = String.format("SEND_CHUNK %02d %s %d %d %d\n",
@@ -234,7 +242,6 @@ public class PeerBackupRestore {
                                 }
                                 continue;
                             } else {
-                                // Other error (checksum mismatch, etc.), fail immediately
                                 System.err.printf("Chunk %d failed with error: %s\n", chunkId, ack);
                                 break;
                             }
@@ -315,35 +322,38 @@ public class PeerBackupRestore {
             return;
         }
 
-        // Get unique storage peer names from the list
-        java.util.Set<String> uniquePeers = new java.util.LinkedHashSet<>();
+        //build the peer array
+        java.util.Set<String> uniquePeerNames = new java.util.LinkedHashSet<>();
         for (String pn : peerNames) {
-            uniquePeers.add(pn);
+            uniquePeerNames.add(pn);
+        }
+        
+        PeerData[] storagePeers = new PeerData[uniquePeerNames.size()];
+        int idx = 0;
+        for (String peerName : uniquePeerNames) {
+            PeerData pd = knownPeers.get(peerName);
+            if (pd == null) {
+                System.out.println("Unknown peer: " + peerName + ". Try 'list' first.");
+                return;
+            }
+            storagePeers[idx++] = pd;
         }
 
-        PeerData target = null;
-        for (String storagePeerName : uniquePeers) {
-            target = knownPeers.get(storagePeerName);
-            if (target != null) break;
-        }
-
-        if (target == null) {
-            System.out.println("Cannot find storage peer. Try 'list'.");
-            return;
-        }
+        System.out.printf("Restoring from %d peers: %s\n", storagePeers.length, uniquePeerNames);
 
         File outDir = new File("restored");
         outDir.mkdirs();
         File outFile = new File(outDir, planFile);
 
-        // Determine how many chunks to retrieve by checking what exists
         int chunkId = 0;
         boolean allChunksValid = true;
 
         try (FileOutputStream fos = new FileOutputStream(outFile)) {
             while (true) {
-                // Try to get next chunk
-                try (Socket sock = new Socket(target.getIp(), target.getTcpPort())) {
+                //Round-robin: select peer for this chunk
+                PeerData targetPeer = storagePeers[chunkId % storagePeers.length];
+                
+                try (Socket sock = new Socket(targetPeer.getIp(), targetPeer.getTcpPort())) {
                     InputStream in = sock.getInputStream();
                     OutputStream out = sock.getOutputStream();
 
@@ -352,7 +362,6 @@ public class PeerBackupRestore {
                     out.write(header.getBytes());
                     out.flush();
 
-                    // Read response header
                     StringBuilder line = new StringBuilder();
                     int c;
                     while ((c = in.read()) != -1 && c != '\n') line.append((char) c);
@@ -386,8 +395,8 @@ public class PeerBackupRestore {
 
                     long calc = crc.getValue();
                     boolean ok = (calc == checksum);
-                    System.out.printf("Chunk %d: checksum match? %s (expected=%d actual=%d, size=%d)\n",
-                            chunkId, ok, checksum, calc, chunkSize);
+                    System.out.printf("Chunk %d from %s: checksum match? %s (expected=%d actual=%d, size=%d)\n",
+                            chunkId, uniquePeerNames.toArray()[chunkId % storagePeers.length], ok, checksum, calc, chunkSize);
 
                     if (!ok) {
                         allChunksValid = false;
@@ -422,7 +431,7 @@ public class PeerBackupRestore {
     }
 
 
-    // local RQ generator for backup/restore
+    //local RQ generator for backup/restore
     private static int localCounter = 0;
     private static int nextRq() { return (localCounter++ % 99) + 1; }
 }

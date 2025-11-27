@@ -23,7 +23,7 @@ public class ServerMessageHandler {
             DatagramSocket ds,
             DatagramPacket dpReceive,
             HashMap<String, PeerData> peers,
-            HashMap<String, java.util.List<String>> backupTable, // {"owner:filename" -> ["peer:chunkID", ...]}
+            HashMap<String, java.util.List<String>> backupTable, 
             java.util.Map<String, Long> lastHeartbeat,
             java.util.Map<String, Integer> heartbeatChunkCounts
     ) throws IOException {
@@ -115,8 +115,9 @@ public class ServerMessageHandler {
             java.util.List<PeerData> eligiblePeers = new java.util.ArrayList<>();
             for (PeerData pd : peers.values()) {
                 if (!pd.getName().equals(owner) && !"OWNER".equalsIgnoreCase(pd.getRole())) {
-                	int storage = Integer.parseInt(pd.getStorage().replace("MB", ""));
-                	if(storage >= fileSize) {
+                	int storageMB = Integer.parseInt(pd.getStorage().replace("MB", ""));
+                	long storageBytes = storageMB * 1024L * 1024L; // Convert MB to bytes
+                	if(storageBytes >= fileSize) {
                 		sendtoSpecificPeer(ds, pd, String.format("STORAGE_TASK %02d %s %d %s", rq, fileName, fileSize, owner));
                         eligiblePeers.add(pd);
                 	}
@@ -128,51 +129,47 @@ public class ServerMessageHandler {
                 return;
             }
             
-            // Round-robin selection
-            PeerData chosen = eligiblePeers.get(storageSelectionIndex % eligiblePeers.size());
-            storageSelectionIndex++;
-            System.out.printf("Selected storage peer %s (%d of %d available)%n", 
-                chosen.getName(), (storageSelectionIndex % eligiblePeers.size()) + 1, eligiblePeers.size());
             int chunkSize = 4096; //fixed size for now
-
-            //Calculate number of chunks
             int numChunks = (int) Math.ceil((double) fileSize / chunkSize);
 
-            //Peer list
-            String peerList = "[" + chosen.getName() + "]";
+            // Build peer list - distribute chunks round-robin across all eligible peers
+            StringBuilder peerListBuilder = new StringBuilder("[");
+            for (int i = 0; i < eligiblePeers.size(); i++) {
+                if (i > 0) peerListBuilder.append(",");
+                peerListBuilder.append(eligiblePeers.get(i).getName());
+            }
+            peerListBuilder.append("]");
+            String peerList = peerListBuilder.toString();
+            
             String plan = String.format("BACKUP_PLAN %02d %s %s %d", rq, fileName, peerList, chunkSize);
-            System.out.printf("BACKUP_REQ(rq=%02d file=%s size=%d checksum=%d owner=%s numChunks=%d) -> %s%n", 
-                rq, fileName, fileSize, checksum, owner, numChunks, plan);
+            System.out.printf("BACKUP_REQ(rq=%02d file=%s size=%d checksum=%d owner=%s numChunks=%d peers=%d) -> %s%n", 
+                rq, fileName, fileSize, checksum, owner, numChunks, eligiblePeers.size(), plan);
             sendSimple(ds, dpReceive, plan);
 
-            // Initialize backup table entry IMMEDIATELY so CHUNK_OK handler can find it
             String backupKey = owner + ":" + fileName;
             backupTable.put(backupKey, new java.util.ArrayList<>());
             System.out.printf("Created backupTable entry: %s%n", backupKey);
 
-            // Prime: send STORE_REQ for chunk 0 first to avoid race with first TCP SEND_CHUNK
-            if (numChunks > 0) {
-                int serverRq0 = nextServerRq();
-                String storeReq0 = String.format("STORE_REQ %02d %s %d %s", serverRq0, fileName, 0, owner);
-                System.out.printf("Priming STORE_REQ to %s: %s%n", chosen.getName(), storeReq0);
-                byte[] d0 = storeReq0.getBytes();
-                ds.send(new DatagramPacket(d0, d0.length, chosen.getIp(), chosen.getUdpPort()));
-                // Duplicate send to improve reliability of UDP delivery
-                try { Thread.sleep(100); } catch (InterruptedException ignore) {}
-                ds.send(new DatagramPacket(d0, d0.length, chosen.getIp(), chosen.getUdpPort()));
-                try { Thread.sleep(150); } catch (InterruptedException ignore) {}
-            }
-
-            // Send remaining STORE_REQ (starting from 1)
-            for (int chunkId = 1; chunkId < numChunks; chunkId++) {
+            //the store req is now spread out over the peers using round robin in order for recovery to work
+            for (int chunkId = 0; chunkId < numChunks; chunkId++) {
+                PeerData targetPeer = eligiblePeers.get(storageSelectionIndex % eligiblePeers.size());
+                storageSelectionIndex++;
+                
                 int serverRq = nextServerRq();
                 String storeReq = String.format("STORE_REQ %02d %s %d %s", serverRq, fileName, chunkId, owner);
-                System.out.printf("Sending STORE_REQ to %s: %s%n", chosen.getName(), storeReq);
+                System.out.printf("Sending STORE_REQ to %s: %s (chunk %d/%d)%n", 
+                    targetPeer.getName(), storeReq, chunkId + 1, numChunks);
+                
                 byte[] d = storeReq.getBytes();
-                // Send twice for reliability
-                ds.send(new DatagramPacket(d, d.length, chosen.getIp(), chosen.getUdpPort()));
-                try { Thread.sleep(50); } catch (InterruptedException ignore) {}
-                ds.send(new DatagramPacket(d, d.length, chosen.getIp(), chosen.getUdpPort()));
+                ds.send(new DatagramPacket(d, d.length, targetPeer.getIp(), targetPeer.getUdpPort()));
+                if (chunkId == 0) {
+                    try { Thread.sleep(100); } catch (InterruptedException ignore) {}
+                    ds.send(new DatagramPacket(d, d.length, targetPeer.getIp(), targetPeer.getUdpPort()));
+                    try { Thread.sleep(150); } catch (InterruptedException ignore) {}
+                } else {
+                    try { Thread.sleep(50); } catch (InterruptedException ignore) {}
+                    ds.send(new DatagramPacket(d, d.length, targetPeer.getIp(), targetPeer.getUdpPort()));
+                }
             }
 
             return;
@@ -354,7 +351,7 @@ public class ServerMessageHandler {
             acceptRegistration(ds, dpReceive.getAddress(), dpReceive.getPort(), msg, 5678, 1024, rq);
             System.out.println("Current peers: " + peers.keySet());
         }
-        //Hashmap DOES already have this peer stored, don't add it to map and deny registration
+        //Hashmap already has this peer stored, don't add it to map and deny registration
         else {
             System.out.printf("Denying registration for existing peer name=%s (total peers=%d)%n", name, peers.size());
             denyRegistration(ds, dpReceive.getAddress(), dpReceive.getPort(), msg, 5678, 1024, rq,
