@@ -11,7 +11,6 @@ import peer.PeerData;
 public class ServerMessageHandler {
 
     private static int serverRqCounter = 0;
-    private static int storageSelectionIndex = 0; // Round-robin counter for storage peer selection
 
     private static int nextServerRq() {
         serverRqCounter = (serverRqCounter % 99) + 1;
@@ -111,16 +110,24 @@ public class ServerMessageHandler {
                 sendSimple(ds, dpReceive, String.format("BACKUP-DENIED %02d REASON: NotRegistered", rq));
                 return;
             }
+            
+            PeerData ownerData = peers.get(owner);
+            if (ownerData != null && "STORAGE".equalsIgnoreCase(ownerData.getRole())) {
+                sendSimple(ds, dpReceive, String.format("BACKUP-DENIED %02d REASON: StorageNodesCannotBackup", rq));
+                System.out.printf("BACKUP_REQ denied: %s has STORAGE-only role (cannot initiate backups)%n", owner);
+                return;
+            }
+            
             //Select a storage peer using round-robin (not the owner)
             java.util.List<PeerData> eligiblePeers = new java.util.ArrayList<>();
             for (PeerData pd : peers.values()) {
-                if (!pd.getName().equals(owner) && !"OWNER".equalsIgnoreCase(pd.getRole())) {
-                	int storageMB = Integer.parseInt(pd.getStorage().replace("MB", ""));
-                	long storageBytes = storageMB * 1024L * 1024L; // Convert MB to bytes
-                	if(storageBytes >= fileSize) {
-                		sendtoSpecificPeer(ds, pd, String.format("STORAGE_TASK %02d %s %d %s", rq, fileName, fileSize, owner));
+                if (!pd.getName().equals(owner) && ("OWNER".equalsIgnoreCase(pd.getRole()) || "STORAGE".equalsIgnoreCase(pd.getRole()))) {
+                    int storageMB = Integer.parseInt(pd.getStorage().replace("MB", ""));
+                    long storageBytes = storageMB * 1024L * 1024L; // Convert MB to bytes
+                    if(storageBytes >= fileSize) {
+                        sendtoSpecificPeer(ds, pd, String.format("STORAGE_TASK %02d %s %d %s", rq, fileName, fileSize, owner));
                         eligiblePeers.add(pd);
-                	}
+                    }
                 }
             }
             
@@ -132,7 +139,8 @@ public class ServerMessageHandler {
             int chunkSize = 4096; //fixed size for now
             int numChunks = (int) Math.ceil((double) fileSize / chunkSize);
 
-            // Build peer list - distribute chunks round-robin across all eligible peers
+
+            // Build peer list and distribute chunks
             StringBuilder peerListBuilder = new StringBuilder("[");
             for (int i = 0; i < eligiblePeers.size(); i++) {
                 if (i > 0) peerListBuilder.append(",");
@@ -140,9 +148,9 @@ public class ServerMessageHandler {
             }
             peerListBuilder.append("]");
             String peerList = peerListBuilder.toString();
-            
+
             String plan = String.format("BACKUP_PLAN %02d %s %s %d", rq, fileName, peerList, chunkSize);
-            System.out.printf("BACKUP_REQ(rq=%02d file=%s size=%d checksum=%d owner=%s numChunks=%d peers=%d) -> %s%n", 
+            System.out.printf("BACKUP_REQ(rq=%02d file=%s size=%d checksum=%d owner=%s numChunks=%d peers=%d) -> %s%n",
                 rq, fileName, fileSize, checksum, owner, numChunks, eligiblePeers.size(), plan);
             sendSimple(ds, dpReceive, plan);
 
@@ -150,25 +158,39 @@ public class ServerMessageHandler {
             backupTable.put(backupKey, new java.util.ArrayList<>());
             System.out.printf("Created backupTable entry: %s%n", backupKey);
 
-            //the store req is now spread out over the peers using round robin in order for recovery to work
-            for (int chunkId = 0; chunkId < numChunks; chunkId++) {
-                PeerData targetPeer = eligiblePeers.get(storageSelectionIndex % eligiblePeers.size());
-                storageSelectionIndex++;
-                
-                int serverRq = nextServerRq();
-                String storeReq = String.format("STORE_REQ %02d %s %d %s", serverRq, fileName, chunkId, owner);
-                System.out.printf("Sending STORE_REQ to %s: %s (chunk %d/%d)%n", 
-                    targetPeer.getName(), storeReq, chunkId + 1, numChunks);
-                
-                byte[] d = storeReq.getBytes();
-                ds.send(new DatagramPacket(d, d.length, targetPeer.getIp(), targetPeer.getUdpPort()));
-                if (chunkId == 0) {
+            if (numChunks == 1) {
+                // Store the single chunk on all eligible peers (replication)
+                int chunkId = 0;
+                int replicationFactor = 2;
+                for (int i = 0; i < eligiblePeers.size(); i++) {
+                    if (i >= replicationFactor) break;
+                    PeerData targetPeer = eligiblePeers.get(i);
+                    int serverRq = nextServerRq();
+                    String storeReq = String.format("STORE_REQ %02d %s %d %s", serverRq, fileName, chunkId, owner);
+                    System.out.printf("Sending STORE_REQ to %s: %s (chunk %d/%d)%n",
+                        targetPeer.getName(), storeReq, chunkId + 1, numChunks);
+                    byte[] d = storeReq.getBytes();
+                    ds.send(new DatagramPacket(d, d.length, targetPeer.getIp(), targetPeer.getUdpPort()));
                     try { Thread.sleep(100); } catch (InterruptedException ignore) {}
                     ds.send(new DatagramPacket(d, d.length, targetPeer.getIp(), targetPeer.getUdpPort()));
                     try { Thread.sleep(150); } catch (InterruptedException ignore) {}
-                } else {
-                    try { Thread.sleep(50); } catch (InterruptedException ignore) {}
-                    ds.send(new DatagramPacket(d, d.length, targetPeer.getIp(), targetPeer.getUdpPort()));
+                }
+            } else {
+                // Distribute each chunk to replicationFactor peers for redundancy
+                int replicationFactor = 2;
+                for (int chunkId = 0; chunkId < numChunks; chunkId++) {
+                    for (int r = 0; r < replicationFactor; r++) {
+                        int peerIndex = (chunkId + r) % eligiblePeers.size();
+                        PeerData targetPeer = eligiblePeers.get(peerIndex);
+                        int serverRq = nextServerRq();
+                        String storeReq = String.format("STORE_REQ %02d %s %d %s", serverRq, fileName, chunkId, owner);
+                        System.out.printf("Sending STORE_REQ to %s: %s (chunk %d/%d, replica %d/%d)%n",
+                            targetPeer.getName(), storeReq, chunkId + 1, numChunks, r + 1, replicationFactor);
+                        byte[] d = storeReq.getBytes();
+                        ds.send(new DatagramPacket(d, d.length, targetPeer.getIp(), targetPeer.getUdpPort()));
+                        try { Thread.sleep(50); } catch (InterruptedException ignore) {}
+                        ds.send(new DatagramPacket(d, d.length, targetPeer.getIp(), targetPeer.getUdpPort()));
+                    }
                 }
             }
 
@@ -176,20 +198,38 @@ public class ServerMessageHandler {
         }
 
         //CHUNK_OK / CHUNK_ERROR: Forward to owner peer
+        if ("REPLICATE_ACK".equalsIgnoreCase(cmd)) {
+            // REPLICATE_ACK fileName chunkId peerName
+            if (parts.length >= 4) {
+                String fileName = parts[1];
+                int chunkId = safeInt(parts[2]);
+                String peerName = parts[3];
+                // Update backupTable: find matching entry and add new replica
+                for (String key : backupTable.keySet()) {
+                    if (key.endsWith(":" + fileName)) {
+                        // Avoid duplicate entries
+                        String entry = peerName + ":" + chunkId;
+                        if (!backupTable.get(key).contains(entry)) {
+                            backupTable.get(key).add(entry);
+                            System.out.printf("[REPLICATE_ACK] Updated backupTable: %s now has %s\n", key, entry);
+                        }
+                        break;
+                    }
+                }
+            }
+            return;
+        }
         if ("CHUNK_OK".equalsIgnoreCase(cmd) || "CHUNK_ERROR".equalsIgnoreCase(cmd)) {
             System.out.println(cmd + " received: " + msg);
             //Extract file name from message to find owner
             if (parts.length >= 3) {
                 String fileNameAck = parts[2];
-                System.out.printf("DEBUG: Looking for owner of file '%s' in backupTable (keys=%s)%n", fileNameAck, backupTable.keySet());
                 //Find owner peer for this file
                 PeerData ownerPeer = null;
                 for (String key : backupTable.keySet()) {
-                    System.out.printf("DEBUG: Checking key '%s' endsWith ':%s' = %b%n", key, fileNameAck, key.endsWith(":" + fileNameAck));
                     if (key.endsWith(":" + fileNameAck)) {
                         String ownerName = key.substring(0, key.indexOf(":"));
                         ownerPeer = peers.get(ownerName);
-                        System.out.printf("DEBUG: Found owner '%s', peer=%s%n", ownerName, ownerPeer);
                         break;
                     }
                 }
@@ -283,6 +323,31 @@ public class ServerMessageHandler {
         }
 
         if ("RESTORE_REQ".equalsIgnoreCase(cmd)) {
+            // Print and log only the relevant backupTable entry for this file
+            if (parts.length >= 3) {
+                String debugOwner = null;
+                for (PeerData pd : peers.values()) {
+                    if (pd.getIp().equals(dpReceive.getAddress()) && pd.getUdpPort() == dpReceive.getPort()) {
+                        debugOwner = pd.getName();
+                        break;
+                    }
+                }
+                if (debugOwner != null) {
+                    String debugKey = debugOwner + ":" + parts[2];
+                    java.util.List<String> debugEntries = backupTable.get(debugKey);
+                    StringBuilder debugOut = new StringBuilder();
+                    debugOut.append("=== BACKUP TABLE FOR RESTORE_REQ ===\n");
+                    debugOut.append(debugKey + " => " + debugEntries + "\n");
+                    debugOut.append("=== END BACKUP TABLE DUMP ===\n");
+                    System.out.print(debugOut.toString());
+                    // Also write to file
+                    try (java.io.FileWriter fw = new java.io.FileWriter("backupTable_debug.log", true)) {
+                        fw.write(debugOut.toString());
+                    } catch (Exception e) {
+                        System.err.println("[DEBUG] Failed to write backupTable to file: " + e.getMessage());
+                    }
+                }
+            }
             if (parts.length < 3) {
                 int rq = parts.length > 1 ? safeInt(parts[1]) : 0;
                 sendSimple(ds, dpReceive,
@@ -309,6 +374,14 @@ public class ServerMessageHandler {
                         String.format("RESTORE_FAIL %02d %s NotRegistered", rq, fileName));
                 return;
             }
+            
+            PeerData ownerData = peers.get(owner);
+            if (ownerData != null && "STORAGE".equalsIgnoreCase(ownerData.getRole())) {
+                sendSimple(ds, dpReceive,
+                        String.format("RESTORE_FAIL %02d %s StorageNodesCannotRestore", rq, fileName));
+                System.out.printf("RESTORE_REQ denied: %s has STORAGE-only role (cannot restore files)%n", owner);
+                return;
+            }
 
             String key = owner + ":" + fileName;
             java.util.List<String> entries = backupTable.get(key);
@@ -318,17 +391,36 @@ public class ServerMessageHandler {
                 return;
             }
 
-            // entries are like "peerName:chunkId"
-            StringBuilder peerList = new StringBuilder("[");
-            for (int i = 0; i < entries.size(); i++) {
-                String entry = entries.get(i);
+            // Only include currently alive peers in RESTORE_PLAN
+            java.util.LinkedHashSet<String> uniqueAlivePeers = new java.util.LinkedHashSet<>();
+            for (String entry : entries) {
                 String peerName = entry.split(":", 2)[0];
-                if (i > 0) peerList.append(',');
-                peerList.append(peerName);
+                if (peers.containsKey(peerName)) {
+                    uniqueAlivePeers.add(peerName);
+                }
             }
-            peerList.append("]");
 
-            String plan = String.format("RESTORE_PLAN %02d %s %s", rq, fileName, peerList);
+            if (uniqueAlivePeers.isEmpty()) {
+                sendSimple(ds, dpReceive,
+                        String.format("RESTORE_FAIL %02d %s NoAlivePeers", rq, fileName));
+                return;
+            }
+
+            // Build mapping: [peer:chunkId,peer:chunkId,...] for only alive peers
+            StringBuilder mapping = new StringBuilder("[");
+            boolean first = true;
+            for (String entry : entries) {
+                String[] partsEntry = entry.split(":", 2);
+                if (partsEntry.length != 2) continue;
+                String peerName = partsEntry[0];
+                String chunkId = partsEntry[1];
+                if (!peers.containsKey(peerName)) continue; // only alive
+                if (!first) mapping.append(",");
+                mapping.append(peerName).append(":").append(chunkId);
+                first = false;
+            }
+            mapping.append("]");
+            String plan = String.format("RESTORE_PLAN %02d %s %s", rq, fileName, mapping.toString());
             System.out.println("Sending: " + plan);
             sendSimple(ds, dpReceive, plan);
             return;

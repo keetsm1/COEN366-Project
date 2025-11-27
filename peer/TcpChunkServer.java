@@ -20,6 +20,14 @@ public class TcpChunkServer {
                                            Map<String, String> expectedStoreReqs) {
         new Thread(() -> {
             try {
+                // Create peer-specific storage directory
+                String storageDir = "storage_" + selfName;
+                File peerStorageRoot = new File(storageDir);
+                if (!peerStorageRoot.exists()) {
+                    peerStorageRoot.mkdirs();
+                    System.out.println("Created peer-specific storage directory: " + storageDir);
+                }
+                
                 System.out.println("TCP chunk server listening on port " + ss.getLocalPort());
                 while (true) {
                     try (Socket s = ss.accept()) {
@@ -77,9 +85,8 @@ public class TcpChunkServer {
                             //For replication, extract owner from existing chunk filename
                             if (isReplication && ownerName == null) {
                                 // Try to find existing chunk to determine owner
-                                File storageRoot = new File("storage");
-                                if (storageRoot.exists()) {
-                                    File[] ownerDirs = storageRoot.listFiles(File::isDirectory);
+                                if (peerStorageRoot.exists()) {
+                                    File[] ownerDirs = peerStorageRoot.listFiles(File::isDirectory);
                                     if (ownerDirs != null) {
                                         for (File dir : ownerDirs) {
                                             File[] chunks = dir.listFiles((d, n) -> n.contains(fileName));
@@ -95,10 +102,9 @@ public class TcpChunkServer {
                                 }
                             }
 
-                            //Store under storage/<ownerName>/
+                            //Store under storage_<peerName>/<ownerName>/
                             // Filename format: O_<ownerName>_S_<saverName>_<fileName>.<chunkId>.part
-                            File baseDir = new File("storage");
-                            File ownerDir = new File(baseDir, ownerName);
+                            File ownerDir = new File(peerStorageRoot, ownerName);
                             ownerDir.mkdirs();
                             String chunkFileName = String.format("O_%s_S_%s_%s.%d.part", 
                                                                  ownerName, selfName, fileName, chunkId);
@@ -136,10 +142,17 @@ public class TcpChunkServer {
 
                             if (ok) {
                                 int rqStore = rq;
-                                String storeAck = String.format("STORE_ACK %02d %s %d", rqStore, fileName, chunkId);
-                                byte[] storeAckData = storeAck.getBytes();
-                                udpSocket.send(new DatagramPacket(storeAckData, storeAckData.length, serverAddr, serverPort));
-                                expectedStoreReqs.remove(storeKey);
+                                if (isReplication) {
+                                    // Send REPLICATE_ACK to server for replicated chunk
+                                    String replicateAck = String.format("REPLICATE_ACK %s %d %s", fileName, chunkId, selfName);
+                                    byte[] replicateAckData = replicateAck.getBytes();
+                                    udpSocket.send(new DatagramPacket(replicateAckData, replicateAckData.length, serverAddr, serverPort));
+                                } else {
+                                    String storeAck = String.format("STORE_ACK %02d %s %d", rqStore, fileName, chunkId);
+                                    byte[] storeAckData = storeAck.getBytes();
+                                    udpSocket.send(new DatagramPacket(storeAckData, storeAckData.length, serverAddr, serverPort));
+                                    expectedStoreReqs.remove(storeKey);
+                                }
                             }
 
                         } else if ("GET_CHUNK".equals(cmd)) {
@@ -152,17 +165,16 @@ public class TcpChunkServer {
                             String fileName = h[2];
                             int chunkId  = safeInt(h[3]);
 
-                            // Locate chunk in storage root or any owner subfolder
+                            // Locate chunk in peer-specific storage or any owner subfolder
                             // Search for both old format and new format (O_*_S_*_fileName.chunkId.part)
                             File inFile = null;
-                            File baseDir = new File("storage");
                             
                             //First try old format
-                            inFile = new File(baseDir, fileName + "." + chunkId + ".part");
+                            inFile = new File(peerStorageRoot, fileName + "." + chunkId + ".part");
                             
                             // Search in owner subdirectories
                             if (!inFile.exists()) {
-                                File[] owners = baseDir.listFiles(File::isDirectory);
+                                File[] owners = peerStorageRoot.listFiles(File::isDirectory);
                                 if (owners != null) {
                                     for (File od : owners) {
                                         // Try old format

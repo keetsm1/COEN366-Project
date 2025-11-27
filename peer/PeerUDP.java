@@ -39,7 +39,24 @@ public class PeerUDP{
         //Send registration message to server
         System.out.println("Write your name:");
         String name = sc.nextLine().trim();
-        sendRegistration(ds, ip, serverPort, name, "BOTH", tcpPort, 1024);
+        
+        System.out.println("\nSelect role:");
+        System.out.println("1. OWNER (can backup/restore/store:full functionality)");
+        System.out.println("2. STORAGE (storage only: cannot backup/restore)");
+        System.out.print("Enter choice (1 or 2): ");
+        String roleChoice = sc.nextLine().trim();
+        
+        String role;
+        if (roleChoice.equals("1")) {
+            role = "OWNER";
+        } else if (roleChoice.equals("2")) {
+            role = "STORAGE";
+        } else {
+            System.out.println("Invalid choice, defaulting to OWNER");
+            role = "OWNER";
+        }
+        
+        sendRegistration(ds, ip, serverPort, name, role, tcpPort, 1024);
 
         // Block for initial registration response BEFORE starting async listener
         byte[] receiveBuffer = new byte[65535];
@@ -67,8 +84,23 @@ public class PeerUDP{
                     //Dispatch processing to worker pool to keep listener responsive
                     workers.submit(() -> {
                         String msg = new String(asyncPkt.getData(), 0, asyncPkt.getLength()).trim();
-                        System.out.printf("Peer received: '%s' from %s:%d%n", msg,
-                                asyncPkt.getAddress().getHostAddress(), asyncPkt.getPort());
+                        // Only print received message for debugging, but skip RESTORE_PLAN to avoid clutter
+                        if (msg.startsWith("RESTORE_PLAN ")) {
+                            // Print only the RESTORE_PLAN header and file name, not the peer array
+                            String[] parts = msg.split(" ", 4);
+                            if (parts.length >= 3) {
+                                System.out.printf("Peer received: 'RESTORE_PLAN %s %s' from %s:%d%n", parts[1], parts[2],
+                                        asyncPkt.getAddress().getHostAddress(), asyncPkt.getPort());
+                            } else {
+                                System.out.printf("Peer received: 'RESTORE_PLAN' from %s:%d%n",
+                                        asyncPkt.getAddress().getHostAddress(), asyncPkt.getPort());
+                            }
+                        } else {
+                            if (!msg.startsWith("CHUNK_OK")) {
+                                System.out.printf("Peer received: '%s' from %s:%d%n", msg,
+                                        asyncPkt.getAddress().getHostAddress(), asyncPkt.getPort());
+                            }
+                        }
                         try {
                             if (msg.startsWith("STORE_REQ")) {
                                 // STORE_REQ RQ# fileName chunkId ownerName
@@ -102,9 +134,9 @@ public class PeerUDP{
                                         String targetIP = p[5];
                                         int targetTCP = Integer.parseInt(p[6]);
                                         
-                                        // Search for chunk in old or new format
+                                        // Search for chunk in peer-specific storage directory
                                         File chunk = null;
-                                        File storageDir = new File("storage");
+                                        File storageDir = new File("storage_" + name);
                                         
                                         // Try root directory first (old format)
                                         chunk = new File(storageDir, fileName + "." + chunkId + ".part");
@@ -164,12 +196,12 @@ public class PeerUDP{
 
         //heartbeat integration
         IntSupplier chunkCountSupplier = () -> {
-            File storageDir = new File("storage");
+            File storageDir = new File("storage_" + name);
             if (storageDir.exists() && storageDir.isDirectory()) {
                 String[] files = storageDir.list();
                 return files != null ? files.length : 0;
             }
-            return 0;
+            return 0; 
         };
         int heartbeatInterval = 30; // sending heartbeat every 10 secs
         heartbeatService = new HeartbeatService(name, ds, serverHost, serverPort, heartbeatInterval, rqCounter, chunkCountSupplier);
@@ -203,11 +235,21 @@ public class PeerUDP{
             }
 
             if(inp.toLowerCase().startsWith("backup")){
+                if ("STORAGE".equals(role)) {
+                    System.out.println("ERROR: Storage-only nodes cannot backup files. Choose OWNER role.");
+                    continue;
+                }
                 PeerBackupRestore.handleBackupRequest(inp, ds, ip, serverPort, knownPeers);
                 continue;
             }
 
             if (inp.toLowerCase().startsWith("restore")) {
+                if ("STORAGE".equals(role)) {
+                    System.out.println("ERROR: Storage-only nodes cannot restore files. Choose OWNER role.");
+                    continue;
+                }
+                // Set peer-specific restore directory
+                System.setProperty("peer.restore.dir", "restored_" + name);
                 PeerBackupRestore.handleRestoreRequest(inp, ds, ip, serverPort, knownPeers);
                 continue;
             }
